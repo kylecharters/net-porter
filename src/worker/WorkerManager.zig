@@ -502,7 +502,7 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
 
     const pid_str = std.fmt.allocPrint(allocator, "{d}", .{catatonit_pid}) catch |err| {
         log.err("Failed to format catatonit PID for uid={d}: {s}", .{ uid, @errorName(err) });
-        return;
+        return err;
     };
     defer allocator.free(pid_str);
 
@@ -543,7 +543,7 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     // Write env file atomically: write to temp then rename
     const tmp_path = std.fmt.allocPrint(allocator, "{s}/.tmp-worker.env", .{uid_dir}) catch |err| {
         log.err("Failed to allocate temp env path for uid={d}: {s}", .{ uid, @errorName(err) });
-        return;
+        return err;
     };
     defer allocator.free(tmp_path);
 
@@ -551,6 +551,12 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     const tmp_path_z = try allocator.allocSentinel(u8, tmp_path.len, 0);
     defer allocator.free(tmp_path_z);
     @memcpy(tmp_path_z[0..tmp_path.len], tmp_path);
+
+    // Clear any stale temp file left by a previous run that crashed between
+    // open and rename. Without this, O_EXCL below would fail forever once a
+    // stale .tmp-worker.env exists. FileNotFound is expected on the normal
+    // path; any other unlink failure will surface as an O_EXCL error below.
+    _ = linux.unlink(tmp_path_z);
 
     // O_EXCL rejects a pre-existing file (defends against symlink-swap attacks
     // where an attacker pre-creates .tmp-worker.env to hijack the write).
