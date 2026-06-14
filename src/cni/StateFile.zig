@@ -31,14 +31,23 @@ pub fn exists(allocator: Allocator, uid: u32, container_id: []const u8, ifname: 
 
 /// Check if a user has any active attachments by scanning their state directory.
 /// Returns true if at least one state file exists for the given uid.
+///
+/// On iteration error, returns true as a safe default: it is safer to keep DHCP
+/// running (and the attachment alive) than to stop it prematurely while
+/// attachments may still exist.
 pub fn hasActiveAttachments(io: std.Io, uid: u32) bool {
     var buf: [256]u8 = undefined;
     const dir_path = std.fmt.bufPrint(&buf, "/run/net-porter/workers/{d}/state", .{uid}) catch return false;
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
-        if (entry.kind == .file) return true;
+    while (iter.next(io)) |maybe_entry| {
+        if (maybe_entry) |entry| {
+            if (entry.kind == .file) return true;
+        }
+    } else |err| {
+        log.warn("hasActiveAttachments: iteration error for uid {d}: {s}; assuming active attachments", .{ uid, @errorName(err) });
+        return true;
     }
     return false;
 }
@@ -57,7 +66,7 @@ pub fn write(io: std.Io, allocator: Allocator, uid: u32, container_id: []const u
     defer allocator.free(dir_path);
 
     // Ensure state directory exists
-    try ensureDir(io, dir_path);
+    try ensureDir(io, allocator, dir_path);
 
     const final_path = try filePath(allocator, uid, container_id, ifname);
     defer allocator.free(final_path);
@@ -127,13 +136,11 @@ pub fn remove(io: std.Io, allocator: Allocator, uid: u32, container_id: []const 
 // ─── Internal helpers ────────────────────────────────────────────────
 
 /// Create a directory with mode 0700. Idempotent (EEXIST is not an error).
-fn ensureDir(io: std.Io, dir_path: []const u8) !void {
-    // Need sentinel-terminated path for posix.chmod
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const path_z = try alloc.allocSentinel(u8, dir_path.len, 0);
+fn ensureDir(io: std.Io, allocator: Allocator, dir_path: []const u8) !void {
+    // Sentinel-terminated path for the chmod syscall. Allocated from the
+    // caller-provided allocator rather than the global page_allocator.
+    const path_z = try allocator.allocSentinel(u8, dir_path.len, 0);
+    defer allocator.free(path_z);
     @memcpy(path_z[0..dir_path.len], dir_path);
 
     // Set restrictive umask before directory creation to ensure 0700 permissions
@@ -221,14 +228,14 @@ fn testDirPath(allocator: Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/1000/state", .{test_workers_dir});
 }
 
-fn testEnsureDir(io: std.Io, dir_path: []const u8) !void {
-    return ensureDir(io, dir_path);
+fn testEnsureDir(io: std.Io, allocator: Allocator, dir_path: []const u8) !void {
+    return ensureDir(io, allocator, dir_path);
 }
 
 fn testWriteFile(io: std.Io, allocator: Allocator, uid: u32, container_id: []const u8, ifname: []const u8, data: []const u8) !void {
     const dir_path = try std.fmt.allocPrint(allocator, "{s}/{d}/state", .{ test_workers_dir, uid });
     defer allocator.free(dir_path);
-    try ensureDir(io, dir_path);
+    try ensureDir(io, allocator, dir_path);
 
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{d}/state/{s}_{s}.json", .{
         test_workers_dir,
@@ -313,7 +320,7 @@ test "ensureDir creates directory with correct permissions" {
     // Clean up any leftover from previous runs
     std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
 
-    try testEnsureDir(io, test_dir);
+    try testEnsureDir(io, allocator, test_dir);
 
     // Verify directory exists
     var statx_buf: std.os.linux.Statx = undefined;
@@ -341,8 +348,8 @@ test "ensureDir is idempotent — calling twice succeeds" {
     // Clean up any leftover
     std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
 
-    try testEnsureDir(io, test_dir);
-    try testEnsureDir(io, test_dir); // second call should succeed
+    try testEnsureDir(io, allocator, test_dir);
+    try testEnsureDir(io, allocator, test_dir); // second call should succeed
 
     // Clean up
     std.Io.Dir.cwd().deleteDir(io, test_dir) catch {};
@@ -370,7 +377,7 @@ test "read returns error for non-existent file" {
     defer testCleanup(io);
 
     // Ensure dir exists so we test FileNotFound on the file, not the dir
-    try testEnsureDir(io, test_workers_dir ++ "/1000/state");
+    try testEnsureDir(io, allocator, test_workers_dir ++ "/1000/state");
 
     const result = testReadFile(io, allocator, "nonexistent", "eth0");
     try std.testing.expectError(error.FileNotFound, result);
