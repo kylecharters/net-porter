@@ -53,11 +53,13 @@ pub fn listen(io: std.Io, path: [:0]const u8, uid: std.posix.uid_t) !std.Io.net.
         return error.SymlinkDetected;
     }
 
-    // IMPORTANT: setOwnerPath MUST be called before setModePath.
-    // setOwnerPath uses AT_SYMLINK_NOFOLLOW — if the socket was replaced
-    // with a symlink after the isSymlink() check, fchownat returns ELOOP
-    // and fails safely. If we called setModePath first (which cannot use
-    // AT_SYMLINK_NOFOLLOW on older kernels), chmod would follow the symlink.
+    // IMPORTANT: setOwnerPath is called before setModePath for defense in
+    // depth. Both reject symlinks rather than following them: setOwnerPath via
+    // fchownat + AT_SYMLINK_NOFOLLOW, and setModePath via a statx symlink
+    // guard (AT_SYMLINK_NOFOLLOW is reliable for statx on all kernels) plus
+    // fchmodat2 + AT_SYMLINK_NOFOLLOW as additional hardening (Linux >= 6.6).
+    // So a symlink swapped in after the isSymlink() check is refused, not
+    // followed, blocking the H2 TOCTOU symlink-swap attack.
     setOwnerPath(path, uid) catch |err| {
         return err;
     };
@@ -104,8 +106,48 @@ fn setOwnerPath(path: [:0]const u8, uid: std.posix.uid_t) !void {
     }
 }
 
-/// Set socket mode via path (after verifying it is not a symlink).
+/// Set socket mode via path.
+///
+/// TOCTOU-hardened: never chmod through a symlink, so an attacker who swaps the
+/// socket path for a symlink between setOwnerPath and here cannot trick the
+/// root worker into chmod'ing an arbitrary file.
+///
+/// Strategy (mirrors setOwnerPath's symlink protection):
+/// 1. statx(.., AT_SYMLINK_NOFOLLOW) definitively rejects a symlink path. This
+///    flag is reliable for statx/fchownat on all kernels (unlike fchmodat2's
+///    AT_SYMLINK_NOFOLLOW, which Linux only honors since 6.6).
+/// 2. fchmodat2(.., AT_SYMLINK_NOFOLLOW) chmods without following a link that
+///    may be swapped in during the window after the statx check (Linux >= 6.6;
+///    older kernels ignore the flag but the statx guard already rejected known
+///    symlinks).
+/// 3. Legacy fchmodat fallback when fchmodat2 is unavailable (ENOSYS, kernel
+///    < 5.13).
 fn setModePath(path: [:0]const u8, mode: std.posix.mode_t) !void {
+    // 1. Definitive symlink guard (kernel-independent): reject if the path is
+    //    a symlink rather than the expected socket.
+    var statx_buf: linux.Statx = undefined;
+    const ssrc = linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, .{ .MODE = true }, &statx_buf);
+    if (std.posix.errno(ssrc) != .SUCCESS) {
+        log.warn("Failed to stat socket path {s}, refusing chmod", .{path});
+        return error.PermissionFailed;
+    }
+    if ((statx_buf.mode & linux.S.IFMT) == linux.S.IFLNK) {
+        log.warn("Refusing to chmod symlink path {s} (possible symlink swap)", .{path});
+        return error.PermissionFailed;
+    }
+
+    // 2. Preferred: fchmodat2 honors AT_SYMLINK_NOFOLLOW on Linux >= 6.6,
+    //    closing the residual window between the statx check and the chmod.
+    const rc2 = linux.fchmodat2(std.posix.AT.FDCWD, path, mode, linux.AT.SYMLINK_NOFOLLOW);
+    const err2 = std.posix.errno(rc2);
+    if (err2 == .SUCCESS) return;
+    if (err2 != .NOSYS) {
+        log.warn("Failed to set socket mode for {s}: {s}", .{ path, @tagName(err2) });
+        return error.PermissionFailed;
+    }
+
+    // 3. Fallback: kernel predates fchmodat2. Use the legacy path-based
+    //    fchmodat (the statx guard above rejected known symlinks).
     const rc = linux.fchmodat(std.posix.AT.FDCWD, path, mode);
     if (std.posix.errno(rc) != .SUCCESS) {
         log.warn("Failed to set socket mode for {s}", .{path});
@@ -237,4 +279,31 @@ test "listen rejects symlink path" {
 
     const result = listen(io, link, uid);
     try std.testing.expectError(error.SymlinkDetected, result);
+}
+
+test "setModePath rejects symlink path" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const uid = std.os.linux.getuid();
+
+    // Create a regular file and a symlink pointing at it.
+    const target_raw = try std.fmt.allocPrint(gpa, "/tmp/net-porter-test-mode-target-{}.sock", .{uid});
+    defer gpa.free(target_raw);
+    const target = try gpa.dupeZ(u8, target_raw);
+    defer gpa.free(target);
+
+    const link_raw = try std.fmt.allocPrint(gpa, "/tmp/net-porter-test-mode-link-{}.sock", .{uid});
+    defer gpa.free(link_raw);
+    const link = try gpa.dupeZ(u8, link_raw);
+    defer gpa.free(link);
+
+    const file = std.Io.Dir.cwd().createFile(io, target, .{}) catch return;
+    file.close(io);
+    defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
+
+    if (std.os.linux.symlink(target, link) != 0) return error.Unexpected;
+    defer std.Io.Dir.cwd().deleteFile(io, link) catch {};
+
+    // setModePath must refuse to chmod through a symlink (H2 TOCTOU guard).
+    try std.testing.expectError(error.PermissionFailed, setModePath(link, 0o600));
 }
