@@ -137,11 +137,18 @@ pub fn run(self: *Server, opts: RunOpts) !void {
         const fixed_fds: usize = 1 + @as(usize, @intFromBool(has_acl_watch)) + @as(usize, @intFromBool(has_wake));
         const total_fds = fixed_fds + wm_fds.len;
 
-        var poll_buf: [256]std.posix.pollfd = undefined;
-        if (total_fds > poll_buf.len) {
-            log.err("Too many poll fds: {d} (max {d})", .{ total_fds, poll_buf.len });
-            return error.TooManyFds;
-        }
+        // Dynamically allocate the pollfd slice sized to the actual worker
+        // count plus fixed fds. The previous fixed [256]pollfd cap killed the
+        // server once total_fds exceeded 256 (~120 UIDs since each worker
+        // contributes 2 pidfds). Allocation per loop iteration is cheap
+        // relative to the poll() syscall itself and avoids a stale capacity
+        // if the worker set shrinks.
+        const allocator = self.worker_manager.allocator;
+        const poll_buf = allocator.alloc(std.posix.pollfd, total_fds) catch |err| {
+            log.err("Failed to allocate {d} pollfds: {s}", .{ total_fds, @errorName(err) });
+            return err;
+        };
+        defer allocator.free(poll_buf);
 
         var slot: usize = 0;
 
@@ -289,7 +296,14 @@ fn handleAclChange(self: *Server) void {
         if (is_added) continue;
 
         const stored_username = self.worker_manager.getWorkerUsername(uid) orelse continue;
-        const current_username = user_mod.getUsername(self.uid_tracker.allocator, uid) catch continue orelse continue;
+        // Distinguish NSS lookup errors (transient — e.g. NSCD hiccup) from a
+        // genuine "user no longer exists" null result. On error, log and skip;
+        // the next ACL change will retry the lookup. Treating an error as
+        // "unchanged" would silently mask a UID-reuse attack.
+        const current_username = user_mod.getUsername(self.uid_tracker.allocator, uid) catch |err| {
+            log.warn("Transient NSS lookup failure for uid={d}: {s}, deferring UID-reuse check to next ACL change", .{ uid, @errorName(err) });
+            continue;
+        } orelse continue;
 
         if (!user_mod.isValidUsername(current_username)) {
             log.warn("Username '{s}' for uid={d} failed validation, skipping", .{ current_username, uid });
