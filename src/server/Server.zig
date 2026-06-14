@@ -364,11 +364,19 @@ fn handleAclChange(self: *Server) void {
 test "handleAclChange updates allowed UIDs from ACL scan" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const test_utils = @import("../test_utils.zig");
 
     var test_dir = try AclScanner.TestAclDir.create(io, allocator);
     defer test_dir.deinit();
 
-    // Create root.json which resolves to uid 0
+    // Use a temporary workers_dir so the test never touches the production
+    // /run/net-porter/workers path. tfr.deinit() runs after server.deinit()
+    // (LIFO defer order); WorkerManager.deinit() only frees memory and does
+    // not access workers_dir, so the directory remains valid for its lifetime.
+    var tfr = try test_utils.newTempFileManager(io, allocator, "srv-wm-");
+    defer tfr.deinit();
+
+    // Create root.json which resolves as uid 0
     try test_dir.writeFile("root.json", "{}");
 
     // Start with a different allowed UID
@@ -389,7 +397,7 @@ test "handleAclChange updates allowed UIDs from ACL scan" {
             .acl_dir = test_dir.dir_path,
             .inotify_fd = null,
         },
-        .worker_manager = WorkerManager.init(io, allocator, null, WorkerManager.production_workers_dir),
+        .worker_manager = WorkerManager.init(io, allocator, null, tfr.temp_dir_path),
         .uid_tracker = UidTracker{
             .allocator = allocator,
             .io = io,
@@ -418,9 +426,16 @@ test "handleAclChange updates allowed UIDs from ACL scan" {
 test "handleAclChange preserves UIDs on empty scan result" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const test_utils = @import("../test_utils.zig");
 
     var test_dir = try AclScanner.TestAclDir.create(io, allocator);
     defer test_dir.deinit();
+
+    // Avoid touching the production /run/net-porter/workers path. See the
+    // first handleAclChange test for the lifetime rationale (tfr.outlives the
+    // server via LIFO defer order).
+    var tfr = try test_utils.newTempFileManager(io, allocator, "srv-wm-");
+    defer tfr.deinit();
 
     // No ACL files - directory is empty
 
@@ -438,7 +453,7 @@ test "handleAclChange preserves UIDs on empty scan result" {
             .acl_dir = test_dir.dir_path,
             .inotify_fd = null,
         },
-        .worker_manager = WorkerManager.init(io, allocator, null, WorkerManager.production_workers_dir),
+        .worker_manager = WorkerManager.init(io, allocator, null, tfr.temp_dir_path),
         .uid_tracker = UidTracker{
             .allocator = allocator,
             .io = io,
@@ -463,9 +478,17 @@ test "handleAclChange preserves UIDs on empty scan result" {
 test "handleAclChange detects username mismatch and stops worker" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const test_utils = @import("../test_utils.zig");
 
     var test_dir = try AclScanner.TestAclDir.create(io, allocator);
     defer test_dir.deinit();
+
+    // Avoid touching the production /run/net-porter/workers path. The injected
+    // worker is stopped via handleAclChange → stopService → removeEnvFile, which
+    // builds paths under workers_dir. tfr.outlives the server via LIFO defer
+    // order, and WorkerManager.deinit() does not access workers_dir.
+    var tfr = try test_utils.newTempFileManager(io, allocator, "srv-wm-");
+    defer tfr.deinit();
 
     // Create root.json which resolves to uid 0
     try test_dir.writeFile("root.json", "{}");
@@ -476,7 +499,7 @@ test "handleAclChange detects username mismatch and stops worker" {
     var entries = std.ArrayList(UidTracker.UidEntry).initCapacity(allocator, 1) catch return error.Unexpected;
     entries.appendAssumeCapacity(.{ .uid = 0 });
 
-    var worker_manager = WorkerManager.init(io, allocator, null, WorkerManager.production_workers_dir);
+    var worker_manager = WorkerManager.init(io, allocator, null, tfr.temp_dir_path);
     const hacker_username = try allocator.dupe(u8, "hacker");
     try worker_manager.injectTestWorker(0, hacker_username);
 
