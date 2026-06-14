@@ -257,43 +257,59 @@ fn setupInotify(self: *WorkerAclManager) void {
 }
 
 /// Process pending inotify events. Returns true if relevant files changed.
+///
+/// Concurrency structure: all inotify fd I/O is performed OUTSIDE the mutex
+/// (read(2) is independent of ACL data), draining every pending event into the
+/// caller-provided buffer first. The mutex is then acquired once to scan the
+/// buffered events, which is necessary only to read a consistent snapshot of
+/// `group_names` (a concurrent `reload()` may swap the list). This keeps the
+/// critical section short and free of I/O.
 pub fn processInotifyEvents(self: *WorkerAclManager, event_buf: []u8) bool {
     const fd = self.inotify_fd orelse return false;
-    var changed = false;
 
-    while (true) {
-        const n = std.posix.read(fd, event_buf) catch |err| switch (err) {
-            error.WouldBlock => return changed,
+    // Phase 1: Drain all pending inotify events into the local buffer with no
+    // lock held. The kernel returns whole events per read, so concatenating
+    // successive reads yields a valid contiguous event stream.
+    var total: usize = 0;
+    while (total < event_buf.len) {
+        const n = std.posix.read(fd, event_buf[total..]) catch |err| switch (err) {
+            error.WouldBlock => break,
             else => {
                 log.warn("Failed to read inotify events: {s}", .{@errorName(err)});
-                return changed;
+                break;
             },
         };
-        if (n == 0) return changed;
+        if (n == 0) break;
+        total += n;
+    }
+    if (total == 0) return false;
 
-        self.mutex.lock(self.io) catch return changed;
-        defer self.mutex.unlock(self.io);
+    // Phase 2: Scan buffered events under the lock. The lock is needed only to
+    // get a consistent view of group_names while iterating.
+    var changed = false;
+    self.mutex.lock(self.io) catch return changed;
+    defer self.mutex.unlock(self.io);
 
-        var offset: usize = 0;
-        while (offset < n) {
-            if (offset + @sizeOf(std.os.linux.inotify_event) > n) break;
+    var offset: usize = 0;
+    while (offset < total) {
+        if (offset + @sizeOf(std.os.linux.inotify_event) > total) break;
 
-            var event: std.os.linux.inotify_event = undefined;
-            @memcpy(std.mem.asBytes(&event), event_buf[offset..][0..@sizeOf(std.os.linux.inotify_event)]);
-            offset += @sizeOf(std.os.linux.inotify_event) + event.len;
+        var event: std.os.linux.inotify_event = undefined;
+        @memcpy(std.mem.asBytes(&event), event_buf[offset..][0..@sizeOf(std.os.linux.inotify_event)]);
+        offset += @sizeOf(std.os.linux.inotify_event) + event.len;
 
-            if (event.len == 0) continue;
-            if (offset > n) break;
+        if (event.len == 0) continue;
+        if (offset > total) break;
 
-            const name_start = offset - event.len;
-            const name = std.mem.sliceTo(event_buf[name_start..], 0);
+        const name_start = offset - event.len;
+        const name = std.mem.sliceTo(event_buf[name_start..], 0);
 
-            if (isRelevantFile(self.username, self.group_names.items, name)) {
-                log.info("ACL file changed: {s}, reloading", .{name});
-                changed = true;
-            }
+        if (isRelevantFile(self.username, self.group_names.items, name)) {
+            log.info("ACL file changed: {s}, reloading", .{name});
+            changed = true;
         }
     }
+    return changed;
 }
 
 /// Get the inotify fd for polling (returns null if not watching).
