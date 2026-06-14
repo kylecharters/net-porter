@@ -577,9 +577,15 @@ pub const PluginConf = struct {
     /// way, `process.wait` is always invoked so the child is reaped and never
     /// becomes a zombie.
     ///
-    /// Note: on Linux < 5.3 where pidfd_open is unavailable, both the pipe
-    /// reads (allocRemaining on stdout/stderr) and process.wait() block
-    /// indefinitely. The timeout protection is only effective on Linux >= 5.3.
+    /// On Linux < 5.3 (or when seccomp/yama blocks `pidfd_open`), the
+    /// fallback path uses a `timerfd` as a pollable timeout source alongside
+    /// the stdout/stderr pipe fds. A hanging plugin is detected when the
+    /// timer fires before the pipes close, and is killed with SIGKILL. This
+    /// prevents a single misbehaving plugin from blocking a worker handler
+    /// thread indefinitely and exhausting the 64-handler pool.
+    ///
+    /// If `timerfd_create` is also unavailable (very old kernel), the
+    /// fallback degrades to legacy blocking behavior with no timeout.
     ///
     /// Errors: returns `error.CniPluginTimeout` when the child has not exited
     /// within `timeout_ms` (child is killed and reaped before returning). All
@@ -676,9 +682,18 @@ pub const PluginConf = struct {
             }
             // n_ready > 0: pidfd is readable, child has exited. Fall through
             // to read pipes and reap normally.
+        } else {
+            // pidfd_open unavailable (kernel < 5.3, or blocked by seccomp).
+            // Without a fallback, a hung plugin would block pipe reads and
+            // process.wait indefinitely — exhausting the 64-handler worker
+            // pool (denial of service). Use a timerfd as a pollable timeout
+            // source alongside the pipe fds.
+            if (try self.execTimerfdFallback(io, &process, allocator, pid, timeout_ms)) {
+                return error.CniPluginTimeout;
+            }
+            // Child exited before the timer fired; fall through to read
+            // pipes and reap normally.
         }
-        // If pidfd_open was unsupported (kernel < 5.3), behave as before:
-        // block in `wait(io)` until the child exits.
 
         // Read stdout and stderr into buffers
         if (process.stdout) |out_file| {
@@ -704,6 +719,131 @@ pub const PluginConf = struct {
 
         self.result = std.ArrayList(u8).fromOwnedSlice(try stdout.toOwnedSlice(allocator));
         return result;
+    }
+
+    /// Fallback timeout path used when `pidfd_open` is unavailable.
+    ///
+    /// Creates a one-shot `timerfd` armed with `timeout_ms` and polls it
+    /// alongside the child's stdout/stderr pipe fds. When the timer fires
+    /// before the pipes close (child has not exited), the child is killed
+    /// with SIGKILL, reaped, and any buffered stderr is drained for
+    /// diagnostics.
+    ///
+    /// Returns `true` if the child timed out (caller should propagate
+    /// `error.CniPluginTimeout`). Returns `false` if the child exited before
+    /// the timer fired (caller proceeds to read pipes and reap normally), or
+    /// if `timerfd_create` is unavailable on this kernel (no protection
+    /// possible; legacy blocking behavior).
+    ///
+    /// On `timeout_ms <= 0`, no fallback is applied (returns `false`); the
+    /// caller behaves as in the legacy path.
+    fn execTimerfdFallback(
+        self: *PluginConf,
+        io: std.Io,
+        process: *std.process.Child,
+        allocator: Allocator,
+        pid: std.posix.pid_t,
+        timeout_ms: i32,
+    ) !bool {
+        const linux = std.os.linux;
+        if (timeout_ms <= 0) return false;
+
+        const timer_fd_raw = linux.timerfd_create(
+            .MONOTONIC,
+            .{ .NONBLOCK = true, .CLOEXEC = true },
+        );
+        if (std.posix.errno(timer_fd_raw) != .SUCCESS) return false;
+        const timer_fd: std.posix.fd_t = @intCast(timer_fd_raw);
+        defer _ = linux.close(timer_fd);
+
+        // Arm a one-shot timer; it_interval=0 means it fires once and then
+        // disarms.
+        const t_ms: i64 = @as(i64, timeout_ms);
+        const its = linux.itimerspec{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{
+                .sec = @intCast(@divFloor(t_ms, std.time.ms_per_s)),
+                .nsec = @intCast(@mod(t_ms, std.time.ms_per_s) * std.time.ns_per_ms),
+            },
+        };
+        const settime_rc = linux.timerfd_settime(timer_fd, .{}, &its, null);
+        if (std.posix.errno(settime_rc) != .SUCCESS) return false;
+
+        // Block on poll indefinitely; the timerfd itself is the timeout.
+        // Loop until either the timer fires or all pipe fds report HUP/ERR
+        // (child has exited and closed the write ends).
+        while (true) {
+            var poll_fds: [3]std.posix.pollfd = undefined;
+            var n: usize = 0;
+            if (process.stdout) |out_file| {
+                poll_fds[n] = .{
+                    .fd = out_file.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                };
+                n += 1;
+            }
+            if (process.stderr) |err_file| {
+                poll_fds[n] = .{
+                    .fd = err_file.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                };
+                n += 1;
+            }
+            const timer_idx = n;
+            poll_fds[n] = .{
+                .fd = timer_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+            n += 1;
+
+            _ = std.posix.poll(poll_fds[0..n], -1) catch |err| {
+                _ = linux.kill(pid, linux.SIG.KILL);
+                _ = process.wait(io) catch {};
+                return err;
+            };
+
+            // Timer fired first — child has not exited within timeout_ms.
+            if ((poll_fds[timer_idx].revents & std.posix.POLL.IN) != 0) {
+                log.warn(
+                    "CNI plugin '{s}' timed out after {d}ms (timerfd fallback); killing pid={d}",
+                    .{ self.getType() orelse "unknown", timeout_ms, pid },
+                );
+                _ = linux.kill(pid, linux.SIG.KILL);
+                _ = process.wait(io) catch {};
+                // Drain stderr buffered before SIGKILL for diagnostics.
+                if (process.stderr) |err_file| {
+                    var read_buffer: [4096]u8 = undefined;
+                    var file_reader = err_file.reader(io, &read_buffer);
+                    if (file_reader.interface.allocRemaining(allocator, .limited(max_plugin_output))) |data| {
+                        if (data.len > 0) {
+                            const truncated = if (data.len > max_stderr_log) data[0..max_stderr_log] else data;
+                            log.warn(
+                                "CNI plugin '{s}' stderr before timeout: {s}",
+                                .{ self.getType() orelse "unknown", truncated },
+                            );
+                            self.stderr_result = std.ArrayList(u8).fromOwnedSlice(data);
+                        } else {
+                            allocator.free(data);
+                        }
+                    } else |_| {}
+                }
+                return true;
+            }
+
+            // All pipe fds closed (HUP/ERR) means the child has exited;
+            // fall through so the caller reads pipes and reaps normally.
+            var all_closed = true;
+            for (poll_fds[0..timer_idx]) |pfd| {
+                if ((pfd.revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) == 0) {
+                    all_closed = false;
+                    break;
+                }
+            }
+            if (all_closed) return false;
+        }
     }
 };
 
@@ -1232,6 +1372,176 @@ test "exec succeeds when plugin exits before timeout" {
     // 5s timeout — much longer than the script needs; the test should
     // succeed long before this fires.
     const term = try plugin_conf.exec(io, allocator, script_path, env_map, 5_000);
+    try std.testing.expectEqual(@as(u8, 0), term.exited);
+}
+
+// -- Tests for execTimerfdFallback (M11: pidfd-unavailable fallback) --
+
+test "execTimerfdFallback returns true and kills hung child before timeout" {
+    // Directly exercises the timerfd fallback path without depending on
+    // pidfd_open being unavailable (which we cannot easily simulate).
+    // Spawns a hanging child and verifies the helper kills it within the
+    // timeout window.
+    const test_utils = @import("../test_utils.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Skip on kernels without timerfd_create (very old Linux). On such
+    // kernels the helper has no fallback mechanism and returns false.
+    {
+        const probe = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+        if (std.posix.errno(probe) != .SUCCESS) return error.SkipZigTest;
+        _ = std.os.linux.close(@intCast(probe));
+    }
+
+    var arena = try ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var conf = try json.ObjectMap.init(a, &.{}, &.{});
+    try conf.put(a, "cniVersion", json.Value{ .string = "1.0.0" });
+    try conf.put(a, "name", json.Value{ .string = "fallback-timeout-test" });
+    try conf.put(a, "type", json.Value{ .string = "hang" });
+
+    var plugin_conf = PluginConf{ .arena = arena, .conf = conf };
+
+    const script_path = try test_utils.uniqueTempPath(
+        io,
+        allocator,
+        ".net-porter-test-fb-hang-",
+        ".sh",
+    );
+    defer allocator.free(script_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, script_path) catch {};
+
+    {
+        const file = try std.Io.Dir.createFileAbsolute(io, script_path, .{
+            .permissions = @enumFromInt(0o755),
+        });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "#!/bin/sh\nexec sleep 30\n");
+    }
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var process = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{script_path},
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .environ_map = &env_map,
+    });
+    // Close stdin since the fallback does not write to it.
+    if (process.stdin) |f| f.close(io);
+    process.stdin = null;
+
+    const pid = process.id.?;
+    var ts_before: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts_before);
+    const timed_out = try plugin_conf.execTimerfdFallback(io, &process, a, pid, 500);
+    var ts_after: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts_after);
+    const elapsed_ms: i64 =
+        (@as(i64, ts_after.sec) - @as(i64, ts_before.sec)) * std.time.ms_per_s +
+        (@divFloor(@as(i64, ts_after.nsec), std.time.ns_per_ms) -
+            @divFloor(@as(i64, ts_before.nsec), std.time.ns_per_ms));
+
+    try std.testing.expect(timed_out);
+    // Returned well under the 30s sleep — proves the child was killed by
+    // the fallback rather than exiting on its own.
+    try std.testing.expect(elapsed_ms < 5_000);
+    // The helper must reap the child (sets process.id to null) so the
+    // errdefer in exec() does not double-reap.
+    try std.testing.expect(process.id == null);
+
+    if (process.stdout) |f| f.close(io);
+    if (process.stderr) |f| f.close(io);
+}
+
+test "execTimerfdFallback returns false when child exits before timeout" {
+    // A plugin that exits quickly must not be flagged as timed out. The
+    // helper should return false so the caller reads pipes and reaps.
+    const test_utils = @import("../test_utils.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Skip on kernels without timerfd_create (very old Linux). The fallback
+    // helper returns false immediately there, which would conflate with the
+    // success-path return value.
+    {
+        const probe = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+        if (std.posix.errno(probe) != .SUCCESS) return error.SkipZigTest;
+        _ = std.os.linux.close(@intCast(probe));
+    }
+
+    var arena = try ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var conf = try json.ObjectMap.init(a, &.{}, &.{});
+    try conf.put(a, "cniVersion", json.Value{ .string = "1.0.0" });
+    try conf.put(a, "name", json.Value{ .string = "fallback-success-test" });
+    try conf.put(a, "type", json.Value{ .string = "true" });
+
+    var plugin_conf = PluginConf{ .arena = arena, .conf = conf };
+
+    const script_path = try test_utils.uniqueTempPath(
+        io,
+        allocator,
+        ".net-porter-test-fb-exit-",
+        ".sh",
+    );
+    defer allocator.free(script_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, script_path) catch {};
+
+    {
+        const file = try std.Io.Dir.createFileAbsolute(io, script_path, .{
+            .permissions = @enumFromInt(0o755),
+        });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "#!/bin/sh\nexit 0\n");
+    }
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var process = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{script_path},
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .environ_map = &env_map,
+    });
+    if (process.stdin) |f| f.close(io);
+    process.stdin = null;
+
+    const pid = process.id.?;
+    const timed_out = try plugin_conf.execTimerfdFallback(io, &process, a, pid, 5_000);
+
+    try std.testing.expect(!timed_out);
+    // On the success path, the helper does NOT reap; the caller is
+    // responsible for reading pipes and reaping.
+    try std.testing.expect(process.id != null);
+
+    // Mirror exec()'s normal post-helper cleanup: read pipes and reap.
+    if (process.stdout) |out_file| {
+        var read_buffer: [4096]u8 = undefined;
+        var file_reader = out_file.reader(io, &read_buffer);
+        const data = try file_reader.interface.allocRemaining(a, .limited(max_plugin_output));
+        a.free(data);
+        out_file.close(io);
+        process.stdout = null;
+    }
+    if (process.stderr) |err_file| {
+        var read_buffer: [4096]u8 = undefined;
+        var file_reader = err_file.reader(io, &read_buffer);
+        const data = try file_reader.interface.allocRemaining(a, .limited(max_plugin_output));
+        a.free(data);
+        err_file.close(io);
+        process.stderr = null;
+    }
+    const term = try process.wait(io);
     try std.testing.expectEqual(@as(u8, 0), term.exited);
 }
 
