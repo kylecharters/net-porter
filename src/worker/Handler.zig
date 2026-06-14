@@ -873,10 +873,7 @@ test "verifyNetnsNsfs accepts nsfs file" {
     // /proc/self/ns/net is an nsfs file (f_type == NSFS_MAGIC).
     // This test verifies the happy path — it may not work in all environments
     // (e.g., some containers may restrict /proc access).
-    const result = verifyNetnsNsfs("/proc/self/ns/net");
-    // Accept both success and error — the test validates the function runs
-    // without crashing, the actual result depends on the environment
-    _ = result catch {};
+    try verifyNetnsNsfs("/proc/self/ns/net");
 }
 
 // ─── logNetnsDiagnostics tests ─────────────────────────────────────────
