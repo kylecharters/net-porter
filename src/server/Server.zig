@@ -374,6 +374,7 @@ test "handleAclChange updates allowed UIDs from ACL scan" {
     // (LIFO defer order); WorkerManager.deinit() only frees memory and does
     // not access workers_dir, so the directory remains valid for its lifetime.
     var tfr = try test_utils.newTempFileManager(io, allocator, "srv-wm-");
+    tfr.should_clean_file = true;
     defer tfr.deinit();
 
     // Create root.json which resolves as uid 0
@@ -435,6 +436,7 @@ test "handleAclChange preserves UIDs on empty scan result" {
     // first handleAclChange test for the lifetime rationale (tfr.outlives the
     // server via LIFO defer order).
     var tfr = try test_utils.newTempFileManager(io, allocator, "srv-wm-");
+    tfr.should_clean_file = true;
     defer tfr.deinit();
 
     // No ACL files - directory is empty
@@ -488,6 +490,7 @@ test "handleAclChange detects username mismatch and stops worker" {
     // builds paths under workers_dir. tfr.outlives the server via LIFO defer
     // order, and WorkerManager.deinit() does not access workers_dir.
     var tfr = try test_utils.newTempFileManager(io, allocator, "srv-wm-");
+    tfr.should_clean_file = true;
     defer tfr.deinit();
 
     // Create root.json which resolves to uid 0
