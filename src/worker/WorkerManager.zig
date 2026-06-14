@@ -298,6 +298,11 @@ fn ensureWorkersLocked(self: *WorkerManager, uids: []const u32) void {
         if (pid_map.get(uid)) |catatonit_pid| {
             self.ensureWorkerWithPidLocked(uid, catatonit_pid) catch |err| {
                 log.warn("ensureWorkers: failed for uid={d}: {s}", .{ uid, @errorName(err) });
+                // Spawn failed — queue for retry on the next cycle unless a
+                // worker is already tracked for this UID.
+                if (self.workers.get(uid) == null) {
+                    self.addPendingLocked(uid);
+                }
             };
         } else {
             // Only add to pending if not already tracked
@@ -392,15 +397,24 @@ fn scheduleRetry(self: *WorkerManager) void {
 /// failure would silently drop worker/catatonit pidfds from the monitored
 /// set, causing worker deaths to go undetected (REL-006).
 fn rebuildMonitoredFds(self: *WorkerManager) void {
+    // Each worker can contribute at most two entries (catatonit pidfd + worker pidfd).
+    const max_entries = self.workers.count() * 2;
+
+    // Reserve capacity BEFORE clearing. ensureTotalCapacity never touches
+    // existing items, so if either reservation fails we can bail out with
+    // the previous fd lists fully intact — monitoring continues with the
+    // last good set instead of being silently dropped.
+    self.monitored_pollfds.ensureTotalCapacity(self.allocator, max_entries) catch {
+        log.warn("rebuildMonitoredFds: pollfd reservation failed for {d} entries, keeping existing {} fds", .{ max_entries, self.monitored_pollfds.items.len });
+        return;
+    };
+    self.monitored_metas.ensureTotalCapacity(self.allocator, max_entries) catch {
+        log.warn("rebuildMonitoredFds: meta reservation failed for {d} entries, keeping existing {} fds", .{ max_entries, self.monitored_metas.items.len });
+        return;
+    };
+
     self.monitored_pollfds.clearRetainingCapacity();
     self.monitored_metas.clearRetainingCapacity();
-
-    // Each worker can contribute at most two entries (catatonit pidfd + worker pidfd).
-    // If pre-allocation fails we cannot safely monitor anything — leave the lists
-    // empty rather than risking a partial, out-of-sync rebuild.
-    const max_entries = self.workers.count() * 2;
-    self.monitored_pollfds.ensureTotalCapacity(self.allocator, max_entries) catch return;
-    self.monitored_metas.ensureTotalCapacity(self.allocator, max_entries) catch return;
 
     var it = self.workers.iterator();
     while (it.next()) |entry| {
@@ -492,17 +506,25 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     // Use config_path if provided, otherwise default
     const config = config_path orelse "/etc/net-porter/config.json";
 
-    // Build env file content
-    var buf = std.ArrayList(u8).initCapacity(allocator, 256) catch return;
+    // Build env file content. Compute the exact size up front and reserve
+    // capacity so every append is infallible — a fixed 256-byte buffer
+    // overflows when --config points at a long path.
+    const prefix_user = "NET_PORTER_USERNAME=";
+    const sep_pid = "\nNET_PORTER_CATATONIT_PID=";
+    const sep_config = "\nNET_PORTER_CONFIG=";
+    const suffix = "\n";
+    const total = prefix_user.len + username.len + sep_pid.len + pid_str.len + sep_config.len + config.len + suffix.len;
+    var buf = std.ArrayList(u8).empty;
+    try buf.ensureTotalCapacity(allocator, total);
     defer buf.deinit(allocator);
 
-    buf.appendSliceAssumeCapacity("NET_PORTER_USERNAME=");
+    buf.appendSliceAssumeCapacity(prefix_user);
     buf.appendSliceAssumeCapacity(username);
-    buf.appendSliceAssumeCapacity("\nNET_PORTER_CATATONIT_PID=");
+    buf.appendSliceAssumeCapacity(sep_pid);
     buf.appendSliceAssumeCapacity(pid_str);
-    buf.appendSliceAssumeCapacity("\nNET_PORTER_CONFIG=");
+    buf.appendSliceAssumeCapacity(sep_config);
     buf.appendSliceAssumeCapacity(config);
-    buf.appendSliceAssumeCapacity("\n");
+    buf.appendSliceAssumeCapacity(suffix);
 
     // Ensure <workers_dir>/<uid> directory exists
     const uid_dir = try workerDir(allocator, uid);
