@@ -500,7 +500,10 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     const path = try envFilePath(allocator, uid);
     defer allocator.free(path);
 
-    const pid_str = std.fmt.allocPrint(allocator, "{d}", .{catatonit_pid}) catch return;
+    const pid_str = std.fmt.allocPrint(allocator, "{d}", .{catatonit_pid}) catch |err| {
+        log.err("Failed to format catatonit PID for uid={d}: {s}", .{ uid, @errorName(err) });
+        return;
+    };
     defer allocator.free(pid_str);
 
     // Use config_path if provided, otherwise default
@@ -538,7 +541,10 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     };
 
     // Write env file atomically: write to temp then rename
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}/.tmp-worker.env", .{uid_dir}) catch return;
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}/.tmp-worker.env", .{uid_dir}) catch |err| {
+        log.err("Failed to allocate temp env path for uid={d}: {s}", .{ uid, @errorName(err) });
+        return;
+    };
     defer allocator.free(tmp_path);
 
     // Write temp file
@@ -546,9 +552,19 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     defer allocator.free(tmp_path_z);
     @memcpy(tmp_path_z[0..tmp_path.len], tmp_path);
 
-    const fd_rc = linux.open(tmp_path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
-    if (fd_rc < 0) {
-        log.warn("Failed to create temp env file {s}", .{tmp_path});
+    // O_EXCL rejects a pre-existing file (defends against symlink-swap attacks
+    // where an attacker pre-creates .tmp-worker.env to hijack the write).
+    // O_NOFOLLOW refuses to follow a symlink at the path. CLOEXEC prevents the
+    // fd from leaking across exec. Mode 0600 keeps the env private to the owner.
+    const fd_rc = linux.open(tmp_path_z, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    if (std.posix.errno(fd_rc) != .SUCCESS) {
+        log.err("Failed to create temp env file {s}: {s}", .{ tmp_path, @tagName(std.posix.errno(fd_rc)) });
         return error.Unexpected;
     }
     var tmp_file = std.Io.File{ .handle = @intCast(fd_rc), .flags = .{ .nonblocking = false } };
@@ -556,8 +572,24 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
 
     var write_buffer: [4096]u8 = undefined;
     var file_writer = tmp_file.writer(io, &write_buffer);
-    file_writer.interface.writeAll(buf.items) catch return error.Unexpected;
-    file_writer.end() catch return error.Unexpected;
+    file_writer.interface.writeAll(buf.items) catch |err| {
+        log.err("Failed to write env file {s} for uid={d}: {s}", .{ tmp_path, uid, @errorName(err) });
+        return error.Unexpected;
+    };
+    file_writer.end() catch |err| {
+        log.err("Failed to flush env file {s} for uid={d}: {s}", .{ tmp_path, uid, @errorName(err) });
+        return error.Unexpected;
+    };
+
+    // fsync the file fd before close so the data is durable on disk before the
+    // atomic rename makes it visible to systemd. Without this, a crash after
+    // rename but before the page cache flushes could leave an empty or partial
+    // env file that systemd reads as the worker's environment.
+    const fsync_rc = linux.fsync(tmp_file.handle);
+    if (std.posix.errno(fsync_rc) != .SUCCESS) {
+        log.err("Failed to fsync env file {s} for uid={d}: {s}", .{ tmp_path, uid, @tagName(std.posix.errno(fsync_rc)) });
+        return error.Unexpected;
+    }
 
     // Atomic rename: temp → final
     const final_path = try envFilePath(allocator, uid);
@@ -568,10 +600,34 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     @memcpy(final_path_z[0..final_path.len], final_path);
 
     const rename_rc = linux.rename(tmp_path_z, final_path_z);
-    if (rename_rc != 0) {
-        log.warn("Failed to rename env file for uid={d}", .{uid});
+    if (std.posix.errno(rename_rc) != .SUCCESS) {
+        log.err("Failed to rename env file {s} -> {s} for uid={d}: {s}", .{
+            tmp_path, final_path, uid, @tagName(std.posix.errno(rename_rc)),
+        });
         _ = linux.unlink(tmp_path_z);
         return error.Unexpected;
+    }
+
+    // Best-effort fsync of the parent directory to make the rename durable
+    // across a crash. Failure here is non-fatal: the file data is already
+    // durable (file fsync above), only the directory entry update is at risk.
+    const uid_dir_z = try allocator.allocSentinel(u8, uid_dir.len, 0);
+    defer allocator.free(uid_dir_z);
+    @memcpy(uid_dir_z[0..uid_dir.len], uid_dir);
+    const dir_fd_rc = linux.open(uid_dir_z, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    if (std.posix.errno(dir_fd_rc) == .SUCCESS) {
+        const dir_fd: std.posix.fd_t = @intCast(dir_fd_rc);
+        const dir_fsync_rc = linux.fsync(dir_fd);
+        if (std.posix.errno(dir_fsync_rc) != .SUCCESS) {
+            log.warn("Failed to fsync parent directory {s} for uid={d}: {s}", .{
+                uid_dir, uid, @tagName(std.posix.errno(dir_fsync_rc)),
+            });
+        }
+        _ = linux.close(dir_fd);
     }
 }
 
