@@ -39,13 +39,15 @@ pub fn init(io: std.Io, allocator: Allocator, caller_uid: std.posix.uid_t, cni_p
 }
 
 pub fn deinit(self: *DhcpService) void {
-    const locked = blk: {
-        self.mutex.lock(self.io) catch break :blk false;
-        break :blk true;
+    // deinit is the teardown path for this service. Silently skipping our own
+    // mutex would let stop()/free() run unserialized, racing with concurrent
+    // users of the service. A lock failure here is a logic bug, so we panic
+    // after logging rather than proceeding unsynchronized.
+    self.mutex.lock(self.io) catch |err| {
+        log.err("deinit: mutex lock failed: {s}", .{@errorName(err)});
+        @panic("DhcpService.deinit: mutex lock failed");
     };
-    defer {
-        if (locked) self.mutex.unlock(self.io);
-    }
+    defer self.mutex.unlock(self.io);
     self.stop();
 
     self.removeSocketPath();
