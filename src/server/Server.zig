@@ -52,8 +52,14 @@ pub fn new(opts: Opts) !Server {
     // Scan ACL directory for allowed UIDs (username → UID resolution)
     var acl_manager = AclScanner.init(allocator, conf.acl_dir);
 
-    const allowed_uids = acl_manager.scanUids(io);
+    var allowed_uids = acl_manager.scanUids(io);
     log.info("ACL scan: {} allowed UIDs", .{allowed_uids.items.len});
+
+    // UidTracker.init takes ownership of allowed_uids on success. Use errdefer
+    // (not defer) so the list is freed only on the error path — if init
+    // succeeds, ownership transfers to the tracker and a defer would
+    // double-free when the server is later deinit'd.
+    errdefer allowed_uids.deinit(allocator);
 
     var uid_tracker = try UidTracker.init(io, allocator, allowed_uids);
 
