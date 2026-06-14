@@ -1126,6 +1126,39 @@ test "writeEnvFile uses default config when null" {
     try std.testing.expect(std.mem.indexOf(u8, content, "NET_PORTER_CONFIG=/etc/net-porter/config.json") != null);
 }
 
+test "scenario: writeEnvFile handles long config path without overflow" {
+    // Regression for H3: a fixed 256-byte buffer in an earlier version
+    // overflowed when --config pointed at a very long path. The current
+    // implementation computes exact size and reserves capacity.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const uid = 9998;
+
+    const long_config = try allocator.alloc(u8, 3000);
+    defer allocator.free(long_config);
+    @memset(long_config, '/');
+    long_config[0] = '/';
+    long_config[long_config.len - 1] = 'n';
+
+    writeEnvFile(io, allocator, uid, "testuser", 12345, long_config) catch return error.Unexpected;
+    defer removeEnvFile(io, allocator, uid);
+
+    const path = try envFilePath(allocator, uid);
+    defer allocator.free(path);
+
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unexpected;
+    defer file.close(io);
+
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buffer);
+    const content = file_reader.interface.allocRemaining(allocator, .limited(long_config.len + 512)) catch return error.Unexpected;
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "NET_PORTER_USERNAME=testuser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "NET_PORTER_CONFIG=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, long_config) != null);
+}
+
 // ── Tests: addPendingLocked / scheduleRetry ──────────────────────────
 
 test "addPendingLocked adds UID and deduplicates" {
@@ -1233,6 +1266,64 @@ test "rebuildMonitoredFds builds correct fd lists from workers" {
     // But pidfd = -1 means those entries are skipped
     try std.testing.expectEqual(@as(usize, 0), wm.monitored_pollfds.items.len);
     try std.testing.expectEqual(@as(usize, 0), wm.monitored_metas.items.len);
+}
+
+test "scenario: rebuildMonitoredFds keeps existing fds when allocation fails" {
+    // Regression for H10: on allocation failure, the previous implementation
+    // silently dropped fds from the monitored set. The current implementation
+    // reserves capacity first and bails out if reservation fails, keeping the
+    // previous lists intact.
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    defer wm.deinit();
+
+    const pid = std.os.linux.getpid();
+    const pidfd = blk: {
+        const rc = linux.pidfd_open(pid, 0);
+        if (std.posix.errno(rc) != .SUCCESS) return error.Unexpected;
+        break :blk @as(std.posix.fd_t, @intCast(rc));
+    };
+
+    const test_username = try std.testing.allocator.dupe(u8, "testuser");
+    try wm.workers.put(1000, .{
+        .uid = 1000,
+        .pid = pid,
+        .pidfd = pidfd,
+        .catatonit_pid = pid,
+        .catatonit_pidfd = pidfd,
+        .username = test_username,
+    });
+
+    wm.rebuildMonitoredFds();
+    const baseline_len = wm.monitored_pollfds.items.len;
+    try std.testing.expectEqual(@as(usize, 2), baseline_len);
+    try std.testing.expectEqual(baseline_len, wm.monitored_metas.items.len);
+
+    // Add enough dummy workers to force ensureTotalCapacity to reallocate.
+    // Dummy workers have pidfd = -1 so they do not contribute actual entries,
+    // but each one doubles the required max_entries.
+    var uid: u32 = 2000;
+    while (uid < 2100) : (uid += 1) {
+        const dummy_name = try std.testing.allocator.dupe(u8, "");
+        try wm.workers.put(uid, .{
+            .uid = uid,
+            .pid = pid,
+            .pidfd = -1,
+            .catatonit_pid = pid,
+            .catatonit_pidfd = -1,
+            .username = dummy_name,
+        });
+    }
+
+    // Force allocation failure on the first ensureTotalCapacity.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const saved_allocator = wm.allocator;
+    wm.allocator = failing.allocator();
+    wm.rebuildMonitoredFds();
+    wm.allocator = saved_allocator;
+
+    // Existing fd lists must be preserved, not cleared.
+    try std.testing.expectEqual(baseline_len, wm.monitored_pollfds.items.len);
+    try std.testing.expectEqual(baseline_len, wm.monitored_metas.items.len);
 }
 
 // ── Tests: stopAndCleanup ────────────────────────────────────────────
