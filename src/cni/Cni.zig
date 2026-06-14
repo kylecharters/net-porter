@@ -232,8 +232,21 @@ pub fn setup(self: *Cni, tentative_allocator: Allocator, request: plugin.Request
     defer tentative_allocator.free(state_json);
 
     StateFile.write(self.io, tentative_allocator, caller_uid, container_id, ifname, state_json) catch |err| {
-        log.warn("Failed to persist state for uid={d}, container_id={s}: {s}", .{ caller_uid, container_id, @errorName(err) });
-        // State file write failed, but CNI setup succeeded — log warning and continue
+        log.err(
+            "Failed to persist state for uid={d}, container_id={s}: {s}; rolling back CNI ADD",
+            .{ caller_uid, container_id, @errorName(err) },
+        );
+        // State persistence failed after a successful CNI ADD. Attempt
+        // rollback by issuing CNI DEL; otherwise the just-allocated network
+        // resources (interfaces, IPs, firewall rules) would be orphaned with
+        // no state file to drive a future teardown.
+        attachment.teardown(self.io, tentative_allocator, request, responser) catch |rollback_err| {
+            log.err(
+                "Rollback (CNI DEL) also failed for uid={d}, container_id={s}: {s}; resources may be orphaned and require manual cleanup",
+                .{ caller_uid, container_id, @errorName(rollback_err) },
+            );
+        };
+        return err;
     };
 }
 
