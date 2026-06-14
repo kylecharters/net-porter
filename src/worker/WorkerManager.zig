@@ -260,9 +260,9 @@ pub fn nextRetryTimeoutMs(self: *WorkerManager) ?i32 {
     if (self.next_retry_ns == 0) return null;
 
     const now_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
-    const remaining_ns = self.next_retry_ns - now_ns;
-    if (remaining_ns <= 0) return 0; // Already due
+    if (now_ns >= self.next_retry_ns) return 0; // Already due
 
+    const remaining_ns = self.next_retry_ns - now_ns;
     const remaining_ms = @divTrunc(remaining_ns, std.time.ns_per_ms);
     return std.math.cast(i32, remaining_ms) orelse std.math.maxInt(i32);
 }
@@ -922,7 +922,10 @@ fn discoverAllCatatonitPids(io: std.Io, target_uids: []const u32, allocator: All
     var uid_set = std.HashMap(u32, void, WorkerMapContext, 80).init(allocator);
     defer uid_set.deinit();
     for (target_uids) |uid| {
-        uid_set.put(uid, {}) catch {};
+        uid_set.put(uid, {}) catch |err| {
+            log.warn("allocation failed during /proc scan: {s}", .{@errorName(err)});
+            continue;
+        };
     }
 
     var proc_dir = std.Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch {
@@ -954,7 +957,10 @@ fn discoverAllCatatonitPids(io: std.Io, target_uids: []const u32, allocator: All
 
         // Check process name from /proc/<pid>/comm
         if (isCatatonit(io, pid)) {
-            result.put(proc_uid, pid) catch {};
+            result.put(proc_uid, pid) catch |err| {
+                log.warn("allocation failed during /proc scan: {s}", .{@errorName(err)});
+                continue;
+            };
             log.debug("discoverAllCatatonitPids: found catatonit pid={d} for uid={d}", .{ pid, proc_uid });
 
             // Early termination if all found
