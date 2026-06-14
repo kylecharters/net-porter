@@ -642,3 +642,95 @@ test "isMacAllowed and isIpAllowed are independent" {
     try testing.expect(!mgr.isIpAllowed("mixed-net", 1000, "192.168.1.30"));
     try testing.expect(mgr.isMacAllowed("mixed-net", 1000, "02:42:c0:a8:01:96"));
 }
+
+test "scenario: ACL reload does not race with concurrent permission queries" {
+    // Regression for H7: reload() performs a two-phase swap under the mutex
+    // while query methods also lock. This test exercises the concurrent path
+    // to ensure no crash or torn reads occur.
+    const test_utils = @import("../test_utils.zig");
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const tmp_path = try test_utils.uniqueTempDir(testing.io, allocator, "acl_concurrent_test_");
+    defer allocator.free(tmp_path);
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing.io, tmp_path) catch {};
+    }
+
+    var file_buf: [256]u8 = undefined;
+    const user_file = std.fmt.bufPrint(&file_buf, "{s}/concurrentuser.json", .{tmp_path}) catch return;
+    const initial_json =
+        \\{"grants":[{"resource":"tenant-a"}]}
+    ;
+    {
+        var file = std.Io.Dir.cwd().createFile(testing.io, user_file, .{}) catch return;
+        defer file.close(testing.io);
+        var write_buf: [4096]u8 = undefined;
+        var file_writer = file.writer(testing.io, &write_buf);
+        file_writer.interface.writeAll(initial_json) catch return;
+        file_writer.end() catch return;
+    }
+
+    var mgr = try init(allocator, testing.io, tmp_path, "concurrentuser", 1000);
+    defer mgr.deinit();
+    mgr.load();
+
+    const Iterations = 100;
+
+    const QueryCtx = struct {
+        mgr: *WorkerAclManager,
+        iterations: usize,
+
+        pub fn run(ctx: @This()) void {
+            var i: usize = 0;
+            while (i < ctx.iterations) : (i += 1) {
+                _ = ctx.mgr.isAllowed("tenant-a");
+                _ = ctx.mgr.hasAnyPermission();
+                _ = ctx.mgr.isIpAllowed("tenant-a", 1000, "192.168.1.1");
+            }
+        }
+    };
+
+    const query_thread = try std.Thread.spawn(.{}, QueryCtx.run, .{QueryCtx{ .mgr = &mgr, .iterations = Iterations }});
+
+    var i: usize = 0;
+    while (i < Iterations) : (i += 1) {
+        const new_json = if (i % 2 == 0)
+            "{\"grants\":[{\"resource\":\"tenant-a\"}]}"
+        else
+            "{\"grants\":[{\"resource\":\"tenant-b\"}]}";
+
+        {
+            var file = std.Io.Dir.cwd().createFile(testing.io, user_file, .{}) catch continue;
+            var write_buf: [4096]u8 = undefined;
+            var file_writer = file.writer(testing.io, &write_buf);
+            file_writer.interface.writeAll(new_json) catch {
+                file.close(testing.io);
+                continue;
+            };
+            file_writer.end() catch {
+                file.close(testing.io);
+                continue;
+            };
+            file.close(testing.io);
+        }
+        mgr.reload();
+    }
+
+    query_thread.join();
+
+    // Final reload to a deterministic state and verify consistency.
+    {
+        var file = std.Io.Dir.cwd().createFile(testing.io, user_file, .{}) catch return;
+        defer file.close(testing.io);
+        var write_buf: [4096]u8 = undefined;
+        var file_writer = file.writer(testing.io, &write_buf);
+        file_writer.interface.writeAll(initial_json) catch return;
+        file_writer.end() catch return;
+    }
+    mgr.reload();
+
+    try testing.expect(mgr.isAllowed("tenant-a"));
+    try testing.expect(!mgr.isAllowed("tenant-b"));
+    try testing.expect(mgr.hasAnyPermission());
+}
