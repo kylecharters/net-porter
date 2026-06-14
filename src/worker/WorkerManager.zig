@@ -1052,8 +1052,11 @@ test "discoverAllCatatonitPids returns empty for non-existent UIDs" {
 
 test "checkProcessUidByStat reads /proc/<pid> ownership" {
     const own_pid: std.posix.pid_t = @intCast(std.os.linux.getpid());
-    _ = checkProcessUidByStat(own_pid, 0);
-    _ = checkProcessUidByStat(own_pid, std.math.maxInt(u32));
+    const current_uid = std.os.linux.getuid();
+    // The current process's /proc/<pid> is owned by the real UID, so the
+    // check must match; a deliberately-mismatched UID must not match.
+    try std.testing.expectEqual(true, checkProcessUidByStat(own_pid, current_uid));
+    try std.testing.expectEqual(false, checkProcessUidByStat(own_pid, std.math.maxInt(u32)));
 }
 
 test "isCatatonit returns false for current process" {
@@ -1283,33 +1286,45 @@ test "rebuildMonitoredFds builds correct fd lists from workers" {
     var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
-    const test_username_a = try std.testing.allocator.dupe(u8, "testuser_a");
-    const test_username_b = try std.testing.allocator.dupe(u8, "testuser_b");
+    // Acquire a real pidfd so the >= 0 branches in rebuildMonitoredFds execute
+    // and actually append entries. pidfd_open requires Linux 5.3+; skip
+    // gracefully on environments that do not support it.
+    const pid = std.os.linux.getpid();
+    const pidfd = blk: {
+        const rc = linux.pidfd_open(pid, 0);
+        if (std.posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        break :blk @as(std.posix.fd_t, @intCast(rc));
+    };
+    // deinit closes pidfds stored in worker entries (>= 0), so the fd opened
+    // above is released by `defer wm.deinit()` — same pattern as the scenario
+    // test directly below.
 
-    // Add two worker entries with valid-looking pidfds (use -1 to skip close)
+    const test_username = try std.testing.allocator.dupe(u8, "testuser");
     try wm.workers.put(1000, .{
         .uid = 1000,
-        .pid = 100,
-        .pidfd = -1,
-        .catatonit_pid = 200,
-        .catatonit_pidfd = -1,
-        .username = test_username_a,
-    });
-    try wm.workers.put(2000, .{
-        .uid = 2000,
-        .pid = 300,
-        .pidfd = -1,
-        .catatonit_pid = 400,
-        .catatonit_pidfd = -1,
-        .username = test_username_b,
+        .pid = pid,
+        .pidfd = pidfd,
+        .catatonit_pid = pid,
+        .catatonit_pidfd = pidfd,
+        .username = test_username,
     });
 
     wm.rebuildMonitoredFds();
 
-    // 2 workers × 2 fds each (catatonit + worker) = 4 entries
-    // But pidfd = -1 means those entries are skipped
-    try std.testing.expectEqual(@as(usize, 0), wm.monitored_pollfds.items.len);
-    try std.testing.expectEqual(@as(usize, 0), wm.monitored_metas.items.len);
+    // One worker with both pidfd and catatonit_pidfd valid -> 2 entries.
+    try std.testing.expectEqual(@as(usize, 2), wm.monitored_pollfds.items.len);
+    try std.testing.expectEqual(@as(usize, 2), wm.monitored_metas.items.len);
+
+    // rebuildMonitoredFds appends the catatonit entry first, then the worker
+    // entry, so items[0] is the catatonit pidfd metadata and items[1] the
+    // worker pidfd metadata.
+    try std.testing.expectEqual(pidfd, wm.monitored_pollfds.items[0].fd);
+    try std.testing.expectEqual(@as(u32, 1000), wm.monitored_metas.items[0].uid);
+    try std.testing.expect(wm.monitored_metas.items[0].kind == .catatonit);
+
+    try std.testing.expectEqual(pidfd, wm.monitored_pollfds.items[1].fd);
+    try std.testing.expectEqual(@as(u32, 1000), wm.monitored_metas.items[1].uid);
+    try std.testing.expect(wm.monitored_metas.items[1].kind == .worker);
 }
 
 test "scenario: rebuildMonitoredFds keeps existing fds when allocation fails" {
