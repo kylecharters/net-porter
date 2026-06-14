@@ -325,8 +325,16 @@ fn aclWatchLoop(self: *Worker) void {
 
 fn isTransientAcceptError(err: std.Io.net.Server.AcceptError) bool {
     return switch (err) {
+        // Non-blocking socket with no pending connection.
         error.WouldBlock,
+        // Client vanished between poll and accept.
         error.ConnectionAborted,
+        // Per-process fd limit (EMFILE) — recoverable as fds close.
+        error.ProcessFdQuotaExceeded,
+        // System-wide fd limit (ENFILE) — recoverable as fds close.
+        error.SystemFdQuotaExceeded,
+        // Socket buffer/memory pressure (ENOBUFS/ENOMEM) — recoverable.
+        error.SystemResources,
         => true,
         else => false,
     };
