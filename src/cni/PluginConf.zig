@@ -548,6 +548,14 @@ pub const PluginConf = struct {
         defer allocator.free(buf);
 
         try std.testing.expect(buf.len > 0);
+        // Key fields from the input config must round-trip through stringify
+        try std.testing.expect(std.mem.indexOf(u8, buf, "cniVersion") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf, "\"name\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf, "\"type\"") != null);
+        // Verify the actual values survive the round-trip
+        try std.testing.expect(std.mem.indexOf(u8, buf, "\"1.0.0\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf, "\"test\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf, "\"macvlan\"") != null);
     }
 
     fn setName(self: *PluginConf, name: []const u8) !void {
