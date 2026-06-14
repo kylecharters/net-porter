@@ -40,7 +40,10 @@ pub fn scanUids(self: AclScanner, io: std.Io) std.ArrayList(u32) {
     defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (iter.next(io) catch |err| blk: {
+        log.warn("Failed to read entry from ACL directory '{s}': {s}", .{ self.acl_dir, @errorName(err) });
+        break :blk null;
+    }) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
         // Skip rule collection files (@<name>.json)

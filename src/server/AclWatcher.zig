@@ -16,6 +16,16 @@ const inotify = @import("../utils/Inotify.zig");
 const AclScanner = @import("AclScanner.zig");
 const AclWatcher = @This();
 
+/// inotify event mask indicating the kernel queue overflowed and events were
+/// lost. Defined locally because src/utils/Inotify.zig does not expose it.
+const IN_Q_OVERFLOW: u32 = 0x00004000;
+
+/// Recommended inotify event-buffer size for `processInotifyEvents`. A larger
+/// buffer reduces the chance of `IN_Q_OVERFLOW` under burst load (many
+/// acl.d create/modify/delete events in one read). Callers should allocate a
+/// buffer of at least this many bytes.
+pub const event_buffer_size: usize = 32 * 1024;
+
 allocator: Allocator,
 io: std.Io,
 acl_dir: []const u8,
@@ -86,6 +96,11 @@ pub fn processInotifyEvents(self: *AclWatcher, event_buf: []u8) bool {
             @memcpy(std.mem.asBytes(&event), event_buf[offset..][0..@sizeOf(std.os.linux.inotify_event)]);
             offset += @sizeOf(std.os.linux.inotify_event) + event.len;
 
+            if (event.mask & IN_Q_OVERFLOW != 0) {
+                log.warn("inotify queue overflow on acl.d '{s}': events may have been lost, triggering full re-scan", .{self.acl_dir});
+                changed = true;
+                continue;
+            }
             if (event.len == 0) continue;
             if (offset > n) break;
 
@@ -118,7 +133,7 @@ test "processInotifyEvents returns false when no fd" {
         .inotify_fd = null,
     };
 
-    var event_buf: [4096]u8 = undefined;
+    var event_buf: [event_buffer_size]u8 = undefined;
     try std.testing.expect(!watcher.processInotifyEvents(&event_buf));
 }
 
@@ -185,7 +200,7 @@ test "processInotifyEvents detects .json file creation in watched directory" {
     // Create a .json file to trigger an inotify event
     try test_dir.writeFile("test.json", "{}");
 
-    var event_buf: [4096]u8 = undefined;
+    var event_buf: [event_buffer_size]u8 = undefined;
     const changed = watcher.processInotifyEvents(&event_buf);
     try std.testing.expect(changed);
 }
@@ -203,7 +218,7 @@ test "processInotifyEvents ignores non-json file creation" {
     // Create a non-.json file
     try test_dir.writeFile("readme.txt", "hello");
 
-    var event_buf: [4096]u8 = undefined;
+    var event_buf: [event_buffer_size]u8 = undefined;
     const changed = watcher.processInotifyEvents(&event_buf);
     try std.testing.expect(!changed);
 }
@@ -222,7 +237,7 @@ test "processInotifyEvents ignores @group and dotfiles" {
     try test_dir.writeFile("@group.json", "{}");
     try test_dir.writeFile(".hidden.json", "{}");
 
-    var event_buf: [4096]u8 = undefined;
+    var event_buf: [event_buffer_size]u8 = undefined;
     const changed = watcher.processInotifyEvents(&event_buf);
     try std.testing.expect(!changed);
 }

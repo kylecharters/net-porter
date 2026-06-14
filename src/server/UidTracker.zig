@@ -15,10 +15,23 @@ const UidTracker = @This();
 
 const run_user_dir = "/run/user";
 
+/// inotify event mask indicating the kernel queue overflowed and events were
+/// lost. Defined locally because src/utils/Inotify.zig does not expose it.
+const IN_Q_OVERFLOW: u32 = 0x00004000;
+
+/// Recommended inotify event-buffer size for `processInotifyEvents`. A larger
+/// buffer reduces the chance of `IN_Q_OVERFLOW` under burst load (many
+/// /run/user create/delete events in one read). Callers should allocate a
+/// buffer of at least this many bytes.
+pub const event_buffer_size: usize = 32 * 1024;
+
 /// Result of processing inotify events: UIDs that appeared/disappeared.
 pub const UidEvents = struct {
     created: std.ArrayList(u32),
     removed: std.ArrayList(u32),
+    /// Set when an `IN_Q_OVERFLOW` event was observed. Indicates events may
+    /// have been lost; the caller should perform a full re-scan to reconcile.
+    rescan_needed: bool = false,
 
     pub fn deinit(self: *UidEvents, allocator: Allocator) void {
         self.created.deinit(allocator);
@@ -82,7 +95,10 @@ pub fn scanExisting(self: *UidTracker, io: std.Io) void {
     defer dir.close(io);
 
     var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
+    while (iter.next(io) catch |err| blk: {
+        log.warn("Failed to read entry from {s}: {s}", .{ run_user_dir, @errorName(err) });
+        break :blk null;
+    }) |entry| {
         if (entry.kind != .directory) continue;
         const uid = std.fmt.parseUnsigned(std.posix.uid_t, entry.name, 10) catch continue;
         if (self.isUidAllowed(uid)) {
@@ -217,16 +233,17 @@ pub fn processInotifyEvents(self: *UidTracker, event_buf: []u8) UidEvents {
         created.deinit(self.allocator);
         return .{ .created = .empty, .removed = .empty };
     };
+    var rescan_needed = false;
 
     while (true) {
         const n = std.posix.read(self.inotify_fd, event_buf) catch |err| switch (err) {
-            error.WouldBlock => return .{ .created = created, .removed = removed },
+            error.WouldBlock => return .{ .created = created, .removed = removed, .rescan_needed = rescan_needed },
             else => {
                 log.warn("Failed to read inotify events: {s}", .{@errorName(err)});
-                return .{ .created = created, .removed = removed };
+                return .{ .created = created, .removed = removed, .rescan_needed = rescan_needed };
             },
         };
-        if (n == 0) return .{ .created = created, .removed = removed };
+        if (n == 0) return .{ .created = created, .removed = removed, .rescan_needed = rescan_needed };
 
         var offset: usize = 0;
         while (offset < n) {
@@ -236,6 +253,11 @@ pub fn processInotifyEvents(self: *UidTracker, event_buf: []u8) UidEvents {
             @memcpy(std.mem.asBytes(&event), event_buf[offset..][0..@sizeOf(std.os.linux.inotify_event)]);
             offset += @sizeOf(std.os.linux.inotify_event) + event.len;
 
+            if (event.mask & IN_Q_OVERFLOW != 0) {
+                log.warn("inotify queue overflow on {s}: events may have been lost, full re-scan recommended", .{run_user_dir});
+                rescan_needed = true;
+                continue;
+            }
             if (event.len == 0) continue;
             if (offset > n) break;
 
