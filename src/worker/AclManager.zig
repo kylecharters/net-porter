@@ -181,18 +181,30 @@ fn doLoadInto(
             }
 
             // Store the collection name for later reference
-            const name_copy = arena_alloc.dupe(u8, group_name) catch continue;
-            group_names.append(arena_alloc, name_copy) catch continue;
+            const name_copy = arena_alloc.dupe(u8, group_name) catch |err| {
+                log.warn("Skipping rule collection '{s}' (out of memory duplicating name): {s}", .{ group_name, @errorName(err) });
+                continue;
+            };
+            group_names.append(arena_alloc, name_copy) catch |err| {
+                log.warn("Skipping rule collection '{s}' (out of memory appending name): {s}", .{ group_name, @errorName(err) });
+                continue;
+            };
 
             // Load rule collection: <acl_dir>/@<name>.json
-            const group_path = std.fmt.allocPrint(arena_alloc, "{s}/@{s}.json", .{ self.acl_dir, group_name }) catch continue;
+            const group_path = std.fmt.allocPrint(arena_alloc, "{s}/@{s}.json", .{ self.acl_dir, group_name }) catch |err| {
+                log.warn("Skipping rule collection '{s}' (out of memory building path): {s}", .{ group_name, @errorName(err) });
+                continue;
+            };
             const group_entry = self.parseAclFile(group_path) catch |err| {
                 log.warn("Rule collection '@{s}' not found ({s}), skipping", .{ group_name, @errorName(err) });
                 continue;
             };
             defer group_entry.deinit();
 
-            self.addGrantsTo(arena_alloc, acls, group_entry.value) catch continue;
+            self.addGrantsTo(arena_alloc, acls, group_entry.value) catch |err| {
+                log.warn("Skipping rule collection '@{s}' (failed to add grants): {s}", .{ group_name, @errorName(err) });
+                continue;
+            };
             log.info("Loaded rule collection '@{s}': {} grants", .{ group_name, group_entry.value.grants.len });
         }
     }
