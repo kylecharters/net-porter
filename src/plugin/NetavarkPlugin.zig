@@ -464,11 +464,15 @@ fn exec(self: *NetavarkPlugin, action: PluginAction) !void {
 
 fn validateNetwork(self: *NetavarkPlugin, network: Network) bool {
     if (!std.mem.eql(u8, name, network.driver)) {
-        self.writeError("Expect driver name '{s}' but got '{s}'", .{ name, network.driver }) catch {};
+        self.writeError("Expect driver name '{s}' but got '{s}'", .{ name, network.driver }) catch |err| {
+            log.warn("Failed to report driver mismatch: {s}", .{@errorName(err)});
+        };
         return false;
     }
     _ = network.options.resolveResource() catch {
-        self.writeError("Missing resource in network options", .{}) catch {};
+        self.writeError("Missing resource in network options", .{}) catch |err| {
+            log.warn("Failed to report missing resource: {s}", .{@errorName(err)});
+        };
         return false;
     };
     return true;
