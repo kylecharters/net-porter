@@ -116,7 +116,7 @@ pub fn run(self: *Server, opts: RunOpts) !void {
     log.info("net-porter {s} started, monitoring /run/user/", .{version});
     self.syncWorkers();
 
-    var event_buf: [4096]u8 = undefined;
+    var event_buf: [UidTracker.event_buffer_size]u8 = undefined;
     const has_wake = opts.wake_fd >= 0;
 
     while (true) {
@@ -228,6 +228,15 @@ pub fn run(self: *Server, opts: RunOpts) !void {
             }
             for (uid_events.removed.items) |uid| {
                 self.worker_manager.stopWorker(uid);
+            }
+            // IN_Q_OVERFLOW: kernel dropped events, so created/removed may be
+            // incomplete. Reconcile by re-scanning /run/user/ for allowed UIDs
+            // (picks up missed additions) and re-syncing the worker set with
+            // the tracker's active UID list.
+            if (uid_events.rescan_needed) {
+                log.warn("inotify overflow detected on /run/user/, performing full rescan to reconcile UIDs", .{});
+                self.uid_tracker.scanExisting(self.io);
+                self.syncWorkers();
             }
             uid_events.deinit(self.uid_tracker.allocator);
         }
