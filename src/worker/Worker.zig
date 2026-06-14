@@ -288,7 +288,7 @@ pub fn run(self: *Worker) !void {
 fn aclWatchLoop(self: *Worker) void {
     const fd = self.acl_manager.getInotifyFd() orelse return;
     const shutdown_fd = self.shutdown_pipe[0];
-    var event_buf: [4096]u8 = undefined;
+    var event_buf: [32 * 1024]u8 = undefined;
 
     var poll_fds = [2]std.posix.pollfd{
         .{
