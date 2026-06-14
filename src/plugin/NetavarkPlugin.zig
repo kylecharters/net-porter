@@ -8,7 +8,11 @@ const NetavarkPlugin = @This();
 pub const name = "net-porter";
 pub const version = @import("build_options").version;
 
+/// Maximum request size read from stdin (16 KiB). Bounds memory use when
+/// reading netavark network/exec JSON; larger requests are rejected.
 pub const max_request_size = 16 * 1024;
+/// Maximum response size read from the domain socket (16 KiB). Caps buffer
+/// growth for netavark response payloads (interfaces, DNS, routes).
 pub const max_response_size = 16 * 1024;
 
 const stringify_options = json.Stringify.Options{
