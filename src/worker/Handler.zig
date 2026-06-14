@@ -223,10 +223,10 @@ pub fn handle(self: *Handler) !void {
         request.netns = resolved;
     }
 
-    self.authClient(client_info, &request) catch |err| {
+    self.authClient(client_info, resource) catch |err| {
         log.err("Auth failed for uid={d}, resource={s}: {s}", .{
             client_info.uid,
-            request.resource() catch "<unknown>",
+            resource,
             @errorName(err),
         });
         return;
@@ -244,20 +244,20 @@ pub fn handle(self: *Handler) !void {
     // Static IP validation for setup action
     if (request.action == .setup) {
         if (cni.isStaticIpam()) {
-            self.validateStaticIp(client_info.uid, &request) catch |err| {
+            self.validateStaticIp(client_info.uid, &request, resource) catch |err| {
                 log.err("Static IP validation failed for uid={d}, resource={s}: {s}", .{
                     client_info.uid,
-                    request.resource() catch "<unknown>",
+                    resource,
                     @errorName(err),
                 });
                 return;
             };
         }
         // MAC ACL validation for setup action (deny-by-default)
-        self.validateStaticMac(client_info.uid, &request) catch |err| {
+        self.validateStaticMac(client_info.uid, &request, resource) catch |err| {
             log.err("Static MAC validation failed for uid={d}, resource={s}: {s}", .{
                 client_info.uid,
-                request.resource() catch "<unknown>",
+                resource,
                 @errorName(err),
             });
             return;
@@ -340,13 +340,7 @@ fn getClientInfo(responser: *Responser) std.posix.UnexpectedError!ClientInfo {
     return client_info;
 }
 
-fn authClient(self: *Handler, client_info: ClientInfo, request: *const plugin.Request) !void {
-    const resource = request.resource() catch |err| {
-        log.err("Failed to resolve resource: {s}", .{@errorName(err)});
-        self.responser.writeError("Internal error", .{});
-        return err;
-    };
-
+fn authClient(self: *Handler, client_info: ClientInfo, resource: []const u8) !void {
     // Defense-in-depth: verify connecting UID matches the worker's target UID.
     // Primary defense is socket file permission (0600, owner=uid), but an
     // explicit check prevents misuse if file permissions are somehow bypassed
@@ -371,13 +365,7 @@ fn authClient(self: *Handler, client_info: ClientInfo, request: *const plugin.Re
     }
 }
 
-fn validateStaticIp(self: *Handler, uid: u32, request: *const plugin.Request) !void {
-    const resource = request.resource() catch |err| {
-        log.err("Failed to resolve resource: {s}", .{@errorName(err)});
-        self.responser.writeError("Internal error", .{});
-        return err;
-    };
-
+fn validateStaticIp(self: *Handler, uid: u32, request: *const plugin.Request, resource: []const u8) !void {
     const exec_request = try request.requestExec();
     const static_ips = exec_request.network_options.static_ips orelse {
         self.responser.writeError("Static IP is required", .{});
@@ -399,7 +387,7 @@ fn validateStaticIp(self: *Handler, uid: u32, request: *const plugin.Request) !v
     }
 }
 
-fn validateStaticMac(self: *Handler, uid: u32, request: *const plugin.Request) !void {
+fn validateStaticMac(self: *Handler, uid: u32, request: *const plugin.Request, resource: []const u8) !void {
     const exec_request = try request.requestExec();
     const static_mac = exec_request.network_options.static_mac orelse return;
 
@@ -407,12 +395,6 @@ fn validateStaticMac(self: *Handler, uid: u32, request: *const plugin.Request) !
         self.responser.writeError("static_mac must not be empty", .{});
         return error.InvalidMac;
     }
-
-    const resource = request.resource() catch |err| {
-        log.err("Failed to resolve resource: {s}", .{@errorName(err)});
-        self.responser.writeError("Internal error", .{});
-        return err;
-    };
 
     if (!self.acl_manager.isMacAllowed(resource, uid, static_mac)) {
         self.responser.writeError("MAC address not allowed: {s}", .{static_mac});
