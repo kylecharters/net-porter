@@ -306,7 +306,10 @@ fn aclWatchLoop(self: *Worker) void {
     log.info("ACL watch thread started for uid={d}", .{self.uid});
 
     while (true) {
-        const n = std.posix.poll(&poll_fds, -1) catch continue;
+        const n = std.posix.poll(&poll_fds, -1) catch |err| {
+            log.warn("ACL watch poll failed for uid={d}: {s}", .{ self.uid, @errorName(err) });
+            continue;
+        };
         if (n == 0) continue;
 
         // Shutdown signal takes priority — exit without touching shared state.
