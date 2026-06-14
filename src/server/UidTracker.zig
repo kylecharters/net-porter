@@ -44,6 +44,24 @@ pub const UidEntry = struct {
     uid: std.posix.uid_t,
 };
 
+/// Comparator for sorting `UidEntry` slices by uid ascending.
+/// Used to keep `entries` sorted so `isUidActive` can binary-search.
+fn entryUidLessThan(_: void, lhs: UidEntry, rhs: UidEntry) bool {
+    return lhs.uid < rhs.uid;
+}
+
+/// Order function for binary-searching a `UidEntry` slice by uid.
+/// Used by `std.sort.binarySearch` in `isUidActive`.
+fn entryUidOrder(context: u32, item: UidEntry) std.math.Order {
+    return std.math.order(context, item.uid);
+}
+
+/// Order function for binary-searching a u32 slice.
+/// Used by `std.sort.binarySearch` in `isUidAllowed`.
+fn u32Order(context: u32, item: u32) std.math.Order {
+    return std.math.order(context, item);
+}
+
 allocator: Allocator,
 io: std.Io,
 /// Set of uids that are allowed by ACL (owned externally).
@@ -69,6 +87,11 @@ pub fn init(io: std.Io, allocator: Allocator, allowed_uids: std.ArrayList(u32)) 
         return error.InotifyWatchFailed;
     }
 
+    // Sort allowed_uids once at construction so isUidAllowed can binary-search.
+    // The slice storage is shared (ArrayList holds a pointer); sorting in place
+    // here persists into the returned tracker.
+    std.mem.sort(u32, allowed_uids.items, {}, std.sort.asc(u32));
+
     return UidTracker{
         .allocator = allocator,
         .io = io,
@@ -76,6 +99,13 @@ pub fn init(io: std.Io, allocator: Allocator, allowed_uids: std.ArrayList(u32)) 
         .entries = std.ArrayList(UidEntry).empty,
         .inotify_fd = ifd,
     };
+}
+
+/// Keep `allowed_uids` sorted ascending so `isUidAllowed` can binary-search
+/// in O(log n) instead of scanning linearly on every inotify event.
+/// Call after any mutation that may leave the slice unsorted.
+fn sortAllowedUids(self: *UidTracker) void {
+    std.mem.sort(u32, self.allowed_uids.items, {}, std.sort.asc(u32));
 }
 
 pub fn deinit(self: *UidTracker) void {
@@ -110,11 +140,11 @@ pub fn scanExisting(self: *UidTracker, io: std.Io) void {
 }
 
 /// Check if a uid is in the allowed list.
+/// Requires `allowed_uids` to be sorted ascending (enforced by `init`,
+/// `updateAllowedUids`, and `sortAllowedUids`). Performs an O(log n) binary
+/// search instead of a linear scan.
 pub fn isUidAllowed(self: UidTracker, uid: std.posix.uid_t) bool {
-    for (self.allowed_uids.items) |allowed| {
-        if (allowed == uid) return true;
-    }
-    return false;
+    return std.sort.binarySearch(u32, self.allowed_uids.items, uid, u32Order) != null;
 }
 
 /// Track a UID entry.
@@ -125,6 +155,10 @@ fn addUid(self: *UidTracker, uid: std.posix.uid_t) !void {
     }
 
     try self.entries.append(self.allocator, .{ .uid = uid });
+    // Keep entries sorted so isUidActive can binary-search in O(log n).
+    // Removal (removeUid) preserves sorted order via orderedRemove, so only
+    // insertion needs to re-sort.
+    std.mem.sort(UidEntry, self.entries.items, {}, entryUidLessThan);
     log.info("Tracking uid={d}", .{uid});
 }
 
@@ -205,9 +239,12 @@ pub fn updateAllowedUids(self: *UidTracker, new_uids: std.ArrayList(u32)) UidDel
         }
     }
 
-    // Swap: deinit old, store new
+    // Swap: deinit old, store new. Keep the new slice sorted so isUidAllowed
+    // can binary-search; updateAllowedUids is the only mutation path for
+    // allowed_uids after init (besides the constructor).
     old_uids.deinit(self.allocator);
     self.allowed_uids = new_uids_owned;
+    self.sortAllowedUids();
 
     if (added.items.len > 0 or removed.items.len > 0) {
         log.info("ACL update: {} added, {} removed, {} total allowed", .{ added.items.len, removed.items.len, new_uids_owned.items.len });
@@ -217,11 +254,10 @@ pub fn updateAllowedUids(self: *UidTracker, new_uids: std.ArrayList(u32)) UidDel
 }
 
 /// Check if a UID is currently in the active entries list.
+/// Requires `entries` to be sorted ascending by uid (enforced by `addUid`,
+/// which re-sorts after each append). Performs an O(log n) binary search.
 pub fn isUidActive(self: UidTracker, uid: u32) bool {
-    for (self.entries.items) |entry| {
-        if (entry.uid == uid) return true;
-    }
-    return false;
+    return std.sort.binarySearch(UidEntry, self.entries.items, uid, entryUidOrder) != null;
 }
 
 /// Process pending inotify events.
@@ -643,4 +679,44 @@ test "getActiveUids returns empty list when no entries exist" {
     defer uids.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), uids.items.len);
+}
+
+test "updateAllowedUids keeps allowed_uids sorted for binary search" {
+    // Regression: isUidAllowed relies on allowed_uids being sorted ascending
+    // so it can binary-search. updateAllowedUids must re-sort even when the
+    // caller supplies UIDs in non-sorted order.
+    const allocator = std.testing.allocator;
+
+    var tracker = UidTracker{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .allowed_uids = .empty,
+        .entries = std.ArrayList(UidEntry).empty,
+        .inotify_fd = -1,
+    };
+    defer {
+        tracker.entries.deinit(allocator);
+        tracker.allowed_uids.deinit(allocator);
+    }
+
+    // Supply UIDs in non-sorted order; updateAllowedUids should re-sort.
+    var new_uids = std.ArrayList(u32).initCapacity(allocator, 3) catch return error.Unexpected;
+    new_uids.appendAssumeCapacity(3000);
+    new_uids.appendAssumeCapacity(1000);
+    new_uids.appendAssumeCapacity(2000);
+
+    var delta = tracker.updateAllowedUids(new_uids);
+    defer delta.deinit(allocator);
+
+    // Storage must now be sorted ascending.
+    try std.testing.expectEqual(@as(usize, 3), tracker.allowed_uids.items.len);
+    try std.testing.expectEqual(@as(u32, 1000), tracker.allowed_uids.items[0]);
+    try std.testing.expectEqual(@as(u32, 2000), tracker.allowed_uids.items[1]);
+    try std.testing.expectEqual(@as(u32, 3000), tracker.allowed_uids.items[2]);
+
+    // Binary-search lookups must find every UID regardless of original order.
+    try std.testing.expect(tracker.isUidAllowed(1000));
+    try std.testing.expect(tracker.isUidAllowed(2000));
+    try std.testing.expect(tracker.isUidAllowed(3000));
+    try std.testing.expect(!tracker.isUidAllowed(4000));
 }
