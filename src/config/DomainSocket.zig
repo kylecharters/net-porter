@@ -135,6 +135,13 @@ fn setModePath(path: [:0]const u8, mode: std.posix.mode_t) !void {
         log.warn("Refusing to chmod symlink path {s} (possible symlink swap)", .{path});
         return error.PermissionFailed;
     }
+    // Defense in depth: only chmod a socket. A regular file swapped in after
+    // bind (but before chmod) would otherwise be chmoded to 0600. Rejecting
+    // non-socket file types closes that residual window.
+    if ((statx_buf.mode & linux.S.IFMT) != linux.S.IFSOCK) {
+        log.warn("Refusing to chmod non-socket path {s} (file type=0o{o})", .{ path, statx_buf.mode & linux.S.IFMT });
+        return error.PermissionFailed;
+    }
 
     // 2. Preferred: fchmodat2 honors AT_SYMLINK_NOFOLLOW on Linux >= 6.6,
     //    closing the residual window between the statx check and the chmod.
