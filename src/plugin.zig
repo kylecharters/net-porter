@@ -11,7 +11,17 @@ pub const Response = NetavarkPlugin.Response;
 pub const Interface = NetavarkPlugin.Interface;
 pub const Subnet = NetavarkPlugin.Subnet;
 
-var plugin = NetavarkPlugin.defaultNetavarkPlugin(std.heap.page_allocator);
+// Use DebugAllocator in Debug/ReleaseSafe for double-free / use-after-free
+// detection; page_allocator in ReleaseFast/ReleaseSmall for maximum speed.
+// Mirrors the pattern in server.zig/worker.zig. The plugin is a process-lifetime
+// singleton, so the GPA is intentionally never deinit'd: leak detection is
+// skipped (the OS reclaims on exit), but the memory-safety checks remain active.
+const builtin = @import("builtin");
+const use_gpa = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+var gpa_impl = if (use_gpa) std.heap.DebugAllocator(.{}).init else {};
+const plugin_allocator: std.mem.Allocator = if (use_gpa) gpa_impl.allocator() else std.heap.page_allocator;
+
+var plugin = NetavarkPlugin.defaultNetavarkPlugin(plugin_allocator);
 
 pub fn setIo(io: std.Io) void {
     plugin.io = io;
