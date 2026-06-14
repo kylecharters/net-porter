@@ -198,6 +198,15 @@ pub const Attachment = struct {
         }
     }
 
+    /// Returns the CNI plugin's stdout as a byte slice, or a static fallback
+    /// message when the plugin produced no stdout (result is null). Guards
+    /// against null-unwrap panics in error paths where the plugin exited
+    /// non-zero without producing output (e.g., crashed or was signalled).
+    fn resultForLog(result: ?std.ArrayList(u8)) []const u8 {
+        if (result) |r| return r.items;
+        return "(no stdout)";
+    }
+
     pub fn setup(self: *Attachment, io: std.Io, tentative_allocator: Allocator, request: plugin.Request, responser: *Responser) !void {
         // In the per-user daemon architecture, the worker runs inside the
         // container's mount namespace. The netns path from the request is
@@ -262,7 +271,16 @@ pub const Attachment = struct {
                         log.warn("CNI plugin '{s}' stderr: {s}", .{ exec_config.getType() orelse "unknown", truncated });
                     }
                 }
-                try responseError(tentative_allocator, responser, exec_config.result.?);
+                // Guard against null result: a CNI plugin that exits non-zero
+                // may produce no stdout (e.g., killed by signal before writing).
+                // responseError would panic on null unwrap, so fall back to a
+                // generic error message instead.
+                if (exec_config.result) |result_stdout| {
+                    try responseError(tentative_allocator, responser, result_stdout);
+                } else {
+                    log.warn("CNI plugin '{s}' exited non-zero with no stdout", .{exec_config.getType() orelse "unknown"});
+                    responser.writeError("CNI plugin failed with no stdout", .{});
+                }
                 return error.UnexpectedError;
             }
             if (exec_config.stderr_result) |se| {
@@ -350,7 +368,7 @@ pub const Attachment = struct {
                     .{
                         exec_config.getType() orelse "unknown",
                         request.request.exec.container_name,
-                        exec_config.result.?.items,
+                        resultForLog(exec_config.result),
                     },
                 );
                 if (exec_config.stderr_result) |se| {
@@ -592,6 +610,21 @@ pub const Attachment = struct {
 
         const cni_args = env_map.get("CNI_ARGS").?;
         try std.testing.expect(std.mem.indexOf(u8, cni_args, "MAC=") == null);
+    }
+
+    // --- resultForLog tests (H1: null-result unwrap guard) ---
+
+    test "resultForLog returns items when result is present" {
+        const allocator = std.testing.allocator;
+        const data = try allocator.dupe(u8, "plugin stdout output");
+        var list = std.ArrayList(u8).fromOwnedSlice(data);
+        defer list.deinit(allocator);
+
+        try std.testing.expectEqualStrings("plugin stdout output", resultForLog(list));
+    }
+
+    test "resultForLog returns fallback when result is null" {
+        try std.testing.expectEqualStrings("(no stdout)", resultForLog(null));
     }
 
     // --- injectSlaacIpv6 tests ---
