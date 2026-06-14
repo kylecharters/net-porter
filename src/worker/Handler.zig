@@ -871,8 +871,19 @@ test "verifyNetnsNsfs rejects symlink to non-nsfs" {
 
 test "verifyNetnsNsfs accepts nsfs file" {
     // /proc/self/ns/net is an nsfs file (f_type == NSFS_MAGIC).
-    // This test verifies the happy path — it may not work in all environments
-    // (e.g., some containers may restrict /proc access).
+    // Probe the filesystem type before asserting, so the test skips cleanly
+    // instead of failing in sandboxed CI containers that restrict /proc or
+    // otherwise lack a real nsfs backing store.
+    var probe_buf: Statfs = undefined;
+    const probe_rc = linux.syscall2(
+        .statfs,
+        @intFromPtr(@as([*:0]const u8, "/proc/self/ns/net")),
+        @intFromPtr(&probe_buf),
+    );
+    if (probe_rc != 0 or probe_buf.f_type != NSFS_MAGIC) {
+        // Environment does not expose a real nsfs at /proc/self/ns/net.
+        return error.SkipZigTest;
+    }
     try verifyNetnsNsfs("/proc/self/ns/net");
 }
 
