@@ -374,6 +374,12 @@ test "printInfo()" {
     defer parsed.deinit();
 
     try std.testing.expectEqualSlices(u8, "net-porter", parsed.value.name);
+    try std.testing.expectEqualStrings(version, parsed.value.version);
+    try std.testing.expectEqualStrings("1.0.0", parsed.value.api_version);
+    try std.testing.expectEqualStrings(
+        "A netavark plugin to create host network interface into the rootless container",
+        parsed.value.description,
+    );
 }
 
 pub fn create(self: *NetavarkPlugin) !void {
