@@ -56,7 +56,9 @@ pub fn write(self: *Responser, response: anytype) void {
         stream_writer.interface.writeAll(response) catch |err| {
             self.writeError("Failed to send response: {s}", .{@errorName(err)});
         };
-        stream_writer.interface.flush() catch {};
+        stream_writer.interface.flush() catch |err| {
+            log.warn("Failed to flush response: {s}", .{@errorName(err)});
+        };
         self.done = true;
         return;
     }
@@ -72,8 +74,7 @@ pub fn write(self: *Responser, response: anytype) void {
         return;
     };
     stream_writer.interface.flush() catch |err| {
-        self.writeError("Failed to flush response: {s}", .{@errorName(err)});
-        return;
+        log.warn("Failed to flush response: {s}", .{@errorName(err)});
     };
 
     self.done = true;
