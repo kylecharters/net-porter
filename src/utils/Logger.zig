@@ -83,6 +83,12 @@ test "log" {
             true,
             std.mem.indexOf(u8, infoLog, "info message") != null,
         );
+        // Level text + scope must be written into the info buffer
+        try std.testing.expect(std.mem.indexOf(u8, infoLog, "info(") != null);
+        // Warn must never leak into the info buffer
+        try std.testing.expect(std.mem.indexOf(u8, infoLog, "warning(") == null);
+        // Log line starts with the timestamp prefix "<n>ms "
+        try std.testing.expect(std.mem.indexOf(u8, infoLog, "ms ") != null);
     }
 
     {
@@ -97,6 +103,12 @@ test "log" {
             true,
             std.mem.indexOf(u8, warnLog, "warn message") != null,
         );
+        // Level text + scope must be written into the error/warn buffer
+        try std.testing.expect(std.mem.indexOf(u8, warnLog, "warning(") != null);
+        // Info must never leak into the warn buffer
+        try std.testing.expect(std.mem.indexOf(u8, warnLog, "info(") == null);
+        // Log line starts with the timestamp prefix "<n>ms "
+        try std.testing.expect(std.mem.indexOf(u8, warnLog, "ms ") != null);
     }
 
     temp_file_manager.should_clean_file = true;
