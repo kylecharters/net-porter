@@ -39,7 +39,15 @@ pub const CniLoader = struct {
         defer dir.close(self.io);
 
         var iter = dir.iterate();
-        while (try iter.next(self.io)) |entry| {
+        while (true) {
+            // Catch per-entry iteration errors (e.g., transient I/O) instead of
+            // propagating them as fatal. Log a warning, stop iterating, and
+            // return the configs loaded so far.
+            const maybe_entry = iter.next(self.io) catch |err| {
+                log.warn("Failed to read directory entry in {s}: {s}, skipping remaining entries", .{ self.cni_dir, @errorName(err) });
+                break;
+            };
+            const entry = maybe_entry orelse break;
             // Skip directories and non-config files
             if (entry.kind == .directory) continue;
             if (!std.mem.endsWith(u8, entry.name, ".conf") and !std.mem.endsWith(u8, entry.name, ".conflist")) continue;
