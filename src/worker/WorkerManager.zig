@@ -63,9 +63,18 @@ const max_backoff_ms: u32 = 60000;
 /// memory by writing unbounded output.
 const SYSTEMCTL_OUTPUT_LIMIT: usize = 64 * 1024;
 
+/// Root directory for per-worker data in production (created by tmpfiles.d at
+/// boot). Tests inject their own writable directory via `init` instead of
+/// branching on `builtin.is_test`, which keeps production behaviour decoupled
+/// from the test build mode and avoids relying on `/run` being writable.
+pub const production_workers_dir = "/run/net-porter/workers";
+
 allocator: Allocator,
 io: std.Io,
 config_path: ?[]const u8,
+/// Per-worker data root. Production uses `production_workers_dir`; tests pass a
+/// writable temporary directory so they never touch `/run`.
+workers_dir: []const u8,
 workers: WorkerMap,
 /// Metadata for monitored pidfds — kept in sync with monitored_pollfds.
 monitored_metas: std.ArrayList(FdMeta),
@@ -79,11 +88,12 @@ backoff_ms: u32 = initial_backoff_ms,
 /// Absolute monotonic time (nanoseconds) for next retry. 0 = no retry scheduled.
 next_retry_ns: i96 = 0,
 
-pub fn init(io: std.Io, allocator: Allocator, config_path: ?[]const u8) WorkerManager {
+pub fn init(io: std.Io, allocator: Allocator, config_path: ?[]const u8, workers_dir: []const u8) WorkerManager {
     return .{
         .allocator = allocator,
         .io = io,
         .config_path = config_path,
+        .workers_dir = workers_dir,
         .workers = WorkerMap.init(allocator),
         .monitored_metas = std.ArrayList(FdMeta).empty,
         .monitored_pollfds = std.ArrayList(std.posix.pollfd).empty,
@@ -450,21 +460,17 @@ fn rebuildMonitoredFds(self: *WorkerManager) void {
 
 // ── Internal — spawning / stopping ───────────────────────────────────
 
-/// Root directory for per-worker data.
-/// In production: /run/net-porter/workers (created by tmpfiles.d at boot).
-/// In tests: /tmp/net-porter-test-workers (writable without root).
-const workers_dir = if (@import("builtin").is_test)
-    "/tmp/net-porter-test-workers"
-else
-    "/run/net-porter/workers";
+// The per-worker data root is injected via `init` (see `production_workers_dir`
+// and the `workers_dir` struct field). Path-building helpers below take it as
+// an explicit parameter so they stay pure and testable without a WorkerManager.
 
 /// Build the per-UID worker directory: <workers_dir>/<uid>
-fn workerDir(allocator: Allocator, uid: u32) ![]const u8 {
+fn workerDir(allocator: Allocator, uid: u32, workers_dir: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{d}", .{ workers_dir, uid });
 }
 
 /// Build the environment file path: <workers_dir>/<uid>/worker.env
-fn envFilePath(allocator: Allocator, uid: u32) ![]const u8 {
+fn envFilePath(allocator: Allocator, uid: u32, workers_dir: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{d}/worker.env", .{ workers_dir, uid });
 }
 
@@ -496,8 +502,10 @@ fn runSystemctl(
 
 /// Write the environment file for a worker instance.
 /// The template service file (net-porter-worker@.service) reads this via EnvironmentFile=.
-fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8, catatonit_pid: std.posix.pid_t, config_path: ?[]const u8) !void {
-    const path = try envFilePath(allocator, uid);
+fn writeEnvFile(self: *WorkerManager, uid: u32, username: []const u8, catatonit_pid: std.posix.pid_t, config_path: ?[]const u8) !void {
+    const io = self.io;
+    const allocator = self.allocator;
+    const path = try envFilePath(allocator, uid, self.workers_dir);
     defer allocator.free(path);
 
     const pid_str = std.fmt.allocPrint(allocator, "{d}", .{catatonit_pid}) catch |err| {
@@ -530,7 +538,7 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     buf.appendSliceAssumeCapacity(suffix);
 
     // Ensure <workers_dir>/<uid> directory exists
-    const uid_dir = try workerDir(allocator, uid);
+    const uid_dir = try workerDir(allocator, uid, self.workers_dir);
     defer allocator.free(uid_dir);
     std.Io.Dir.cwd().createDirPath(io, uid_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -598,7 +606,7 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
     }
 
     // Atomic rename: temp → final
-    const final_path = try envFilePath(allocator, uid);
+    const final_path = try envFilePath(allocator, uid, self.workers_dir);
     defer allocator.free(final_path);
 
     const final_path_z = try allocator.allocSentinel(u8, final_path.len, 0);
@@ -639,8 +647,10 @@ fn writeEnvFile(io: std.Io, allocator: Allocator, uid: u32, username: []const u8
 
 /// Remove the environment file for a worker instance.
 /// Also removes the per-UID directory if empty.
-fn removeEnvFile(io: std.Io, allocator: Allocator, uid: u32) void {
-    const path = envFilePath(allocator, uid) catch return;
+fn removeEnvFile(self: *WorkerManager, uid: u32) void {
+    const io = self.io;
+    const allocator = self.allocator;
+    const path = envFilePath(allocator, uid, self.workers_dir) catch return;
     defer allocator.free(path);
 
     const path_z = allocator.allocSentinel(u8, path.len, 0) catch return;
@@ -649,7 +659,7 @@ fn removeEnvFile(io: std.Io, allocator: Allocator, uid: u32) void {
     _ = linux.unlink(path_z);
 
     // Try to clean up empty per-UID directory
-    const uid_dir = workerDir(allocator, uid) catch return;
+    const uid_dir = workerDir(allocator, uid, self.workers_dir) catch return;
     defer allocator.free(uid_dir);
     std.Io.Dir.cwd().deleteDir(io, uid_dir) catch {};
 }
@@ -668,7 +678,7 @@ fn spawnWorker(self: *WorkerManager, uid: u32, catatonit_pid: std.posix.pid_t) !
     }
 
     // Write environment file for the template service to consume
-    writeEnvFile(self.io, self.allocator, uid, username, catatonit_pid, self.config_path) catch |err| {
+    self.writeEnvFile(uid, username, catatonit_pid, self.config_path) catch |err| {
         log.err("Failed to write env file for uid={d}: {s}", .{ uid, @errorName(err) });
         return err;
     };
@@ -770,7 +780,7 @@ fn stopService(self: *WorkerManager, uid: u32) void {
     }
 
     // Clean up env file
-    removeEnvFile(self.io, self.allocator, uid);
+    self.removeEnvFile(uid);
 }
 
 /// Check if a running worker's binary differs from the current server binary.
@@ -1070,7 +1080,7 @@ test "isCatatonit reads /proc/<pid>/comm correctly (not empty)" {
 }
 
 test "nextRetryTimeoutMs returns null when no retry scheduled" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
     try std.testing.expect(wm.nextRetryTimeoutMs() == null);
 }
@@ -1079,9 +1089,16 @@ test "nextRetryTimeoutMs returns null when no retry scheduled" {
 
 test "envFilePath builds correct path" {
     const allocator = std.testing.allocator;
-    const path = try envFilePath(allocator, 1000);
+    const test_utils = @import("../test_utils.zig");
+    var tfr = try test_utils.newTempFileManager(std.testing.io, allocator, "wm-envpath-");
+    defer tfr.deinit();
+
+    const path = try envFilePath(allocator, 1000, tfr.temp_dir_path);
     defer allocator.free(path);
-    try std.testing.expectEqualStrings("/tmp/net-porter-test-workers/1000/worker.env", path);
+
+    const expected = try std.fmt.allocPrint(allocator, "{s}/1000/worker.env", .{tfr.temp_dir_path});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "serviceInstanceName builds correct name" {
@@ -1095,12 +1112,17 @@ test "writeEnvFile writes correct content" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const uid = 1000;
+    const test_utils = @import("../test_utils.zig");
+    var tfr = try test_utils.newTempFileManager(io, allocator, "wm-env-");
+    defer tfr.deinit();
+    var wm = WorkerManager.init(io, allocator, null, tfr.temp_dir_path);
+    defer wm.deinit();
 
-    writeEnvFile(io, allocator, uid, "testuser", 12345, "/etc/net-porter/config.json") catch return error.Unexpected;
-    defer removeEnvFile(io, allocator, uid);
+    wm.writeEnvFile(uid, "testuser", 12345, "/etc/net-porter/config.json") catch return error.Unexpected;
+    defer wm.removeEnvFile(uid);
 
     // Read back and verify
-    const path = try envFilePath(allocator, uid);
+    const path = try envFilePath(allocator, uid, tfr.temp_dir_path);
     defer allocator.free(path);
 
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unexpected;
@@ -1120,11 +1142,16 @@ test "writeEnvFile uses default config when null" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const uid = 9999;
+    const test_utils = @import("../test_utils.zig");
+    var tfr = try test_utils.newTempFileManager(io, allocator, "wm-env-default-");
+    defer tfr.deinit();
+    var wm = WorkerManager.init(io, allocator, null, tfr.temp_dir_path);
+    defer wm.deinit();
 
-    writeEnvFile(io, allocator, uid, "testuser", 12345, null) catch return error.Unexpected;
-    defer removeEnvFile(io, allocator, uid);
+    wm.writeEnvFile(uid, "testuser", 12345, null) catch return error.Unexpected;
+    defer wm.removeEnvFile(uid);
 
-    const path = try envFilePath(allocator, uid);
+    const path = try envFilePath(allocator, uid, tfr.temp_dir_path);
     defer allocator.free(path);
 
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unexpected;
@@ -1145,6 +1172,11 @@ test "scenario: writeEnvFile handles long config path without overflow" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const uid = 9998;
+    const test_utils = @import("../test_utils.zig");
+    var tfr = try test_utils.newTempFileManager(io, allocator, "wm-env-long-");
+    defer tfr.deinit();
+    var wm = WorkerManager.init(io, allocator, null, tfr.temp_dir_path);
+    defer wm.deinit();
 
     const long_config = try allocator.alloc(u8, 3000);
     defer allocator.free(long_config);
@@ -1152,10 +1184,10 @@ test "scenario: writeEnvFile handles long config path without overflow" {
     long_config[0] = '/';
     long_config[long_config.len - 1] = 'n';
 
-    writeEnvFile(io, allocator, uid, "testuser", 12345, long_config) catch return error.Unexpected;
-    defer removeEnvFile(io, allocator, uid);
+    wm.writeEnvFile(uid, "testuser", 12345, long_config) catch return error.Unexpected;
+    defer wm.removeEnvFile(uid);
 
-    const path = try envFilePath(allocator, uid);
+    const path = try envFilePath(allocator, uid, tfr.temp_dir_path);
     defer allocator.free(path);
 
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unexpected;
@@ -1174,7 +1206,7 @@ test "scenario: writeEnvFile handles long config path without overflow" {
 // ── Tests: addPendingLocked / scheduleRetry ──────────────────────────
 
 test "addPendingLocked adds UID and deduplicates" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     wm.addPendingLocked(1000);
@@ -1187,7 +1219,7 @@ test "addPendingLocked adds UID and deduplicates" {
 }
 
 test "addPendingLocked schedules retry if not already scheduled" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     try std.testing.expect(wm.next_retry_ns == 0);
@@ -1196,7 +1228,7 @@ test "addPendingLocked schedules retry if not already scheduled" {
 }
 
 test "addPendingLocked handles multiple different UIDs" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     wm.addPendingLocked(1000);
@@ -1208,7 +1240,7 @@ test "addPendingLocked handles multiple different UIDs" {
 }
 
 test "scheduleRetry sets next_retry_ns in the future" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     const now_ns = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds;
@@ -1220,7 +1252,7 @@ test "scheduleRetry sets next_retry_ns in the future" {
 // ── Tests: ensureWorkerWithPidLocked (no-op case) ───────────────────
 
 test "ensureWorkerWithPidLocked is no-op when worker already running with same catatonit_pid" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     const test_username = try std.testing.allocator.dupe(u8, "testuser");
@@ -1248,7 +1280,7 @@ test "ensureWorkerWithPidLocked is no-op when worker already running with same c
 // ── Tests: rebuildMonitoredFds ───────────────────────────────────────
 
 test "rebuildMonitoredFds builds correct fd lists from workers" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     const test_username_a = try std.testing.allocator.dupe(u8, "testuser_a");
@@ -1285,7 +1317,7 @@ test "scenario: rebuildMonitoredFds keeps existing fds when allocation fails" {
     // silently dropped fds from the monitored set. The current implementation
     // reserves capacity first and bails out if reservation fails, keeping the
     // previous lists intact.
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     const pid = std.os.linux.getpid();
@@ -1341,7 +1373,7 @@ test "scenario: rebuildMonitoredFds keeps existing fds when allocation fails" {
 // ── Tests: stopAndCleanup ────────────────────────────────────────────
 
 test "stopAndCleanup removes worker entry" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     const test_username = try std.testing.allocator.dupe(u8, "testuser");
@@ -1361,7 +1393,7 @@ test "stopAndCleanup removes worker entry" {
 }
 
 test "stopAndCleanup is no-op for non-existent UID" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     // Should not crash
@@ -1372,7 +1404,7 @@ test "stopAndCleanup is no-op for non-existent UID" {
 // ── Tests: getWorkerUsername ──────────────────────────────────────────
 
 test "getWorkerUsername returns stored username for running worker" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     const test_username = try std.testing.allocator.dupe(u8, "alice");
@@ -1392,7 +1424,7 @@ test "getWorkerUsername returns stored username for running worker" {
 }
 
 test "getWorkerUsername returns null for non-existent UID" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     try std.testing.expect(wm.getWorkerUsername(9999) == null);
@@ -1401,7 +1433,7 @@ test "getWorkerUsername returns null for non-existent UID" {
 // ── Tests: stopWorker ────────────────────────────────────────────────
 
 test "stopWorker removes UID from pending list" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     wm.addPendingLocked(1000);
@@ -1416,7 +1448,7 @@ test "stopWorker removes UID from pending list" {
 // ── Tests: isBinaryOutdated ────────────────────────────────────────
 
 test "isBinaryOutdated returns false for current process" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     // Current process is never outdated compared to itself
@@ -1425,7 +1457,7 @@ test "isBinaryOutdated returns false for current process" {
 }
 
 test "isBinaryOutdated returns false for non-existent PID" {
-    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null);
+    var wm = WorkerManager.init(std.testing.io, std.testing.allocator, null, production_workers_dir);
     defer wm.deinit();
 
     // Non-existent PID → readlink fails → fail-open (returns false)

@@ -77,7 +77,7 @@ pub fn new(opts: Opts) !Server {
     };
 
     // Initialize worker manager for per-UID worker processes
-    const worker_manager = WorkerManager.init(io, allocator, opts.config_path);
+    const worker_manager = WorkerManager.init(io, allocator, opts.config_path, WorkerManager.production_workers_dir);
 
     return Server{
         .config = conf,
@@ -389,7 +389,7 @@ test "handleAclChange updates allowed UIDs from ACL scan" {
             .acl_dir = test_dir.dir_path,
             .inotify_fd = null,
         },
-        .worker_manager = WorkerManager.init(io, allocator, null),
+        .worker_manager = WorkerManager.init(io, allocator, null, WorkerManager.production_workers_dir),
         .uid_tracker = UidTracker{
             .allocator = allocator,
             .io = io,
@@ -438,7 +438,7 @@ test "handleAclChange preserves UIDs on empty scan result" {
             .acl_dir = test_dir.dir_path,
             .inotify_fd = null,
         },
-        .worker_manager = WorkerManager.init(io, allocator, null),
+        .worker_manager = WorkerManager.init(io, allocator, null, WorkerManager.production_workers_dir),
         .uid_tracker = UidTracker{
             .allocator = allocator,
             .io = io,
@@ -476,7 +476,7 @@ test "handleAclChange detects username mismatch and stops worker" {
     var entries = std.ArrayList(UidTracker.UidEntry).initCapacity(allocator, 1) catch return error.Unexpected;
     entries.appendAssumeCapacity(.{ .uid = 0 });
 
-    var worker_manager = WorkerManager.init(io, allocator, null);
+    var worker_manager = WorkerManager.init(io, allocator, null, WorkerManager.production_workers_dir);
     const hacker_username = try allocator.dupe(u8, "hacker");
     try worker_manager.injectTestWorker(0, hacker_username);
 
