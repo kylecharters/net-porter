@@ -554,6 +554,10 @@ pub fn ipv6ToU128(addr_str: []const u8) ?u128 {
     if (double_colon_pos) |pos| {
         const before = pos;
         const after = group_count - pos;
+        // Guard against unsigned underflow in `8 - before - after` below.
+        // before + after == group_count, which is capped at 8 elsewhere, but
+        // reject defensively so a future change cannot trip an overflow panic.
+        if (before + after > 8) return null;
         const zeros = 8 - before - after;
         if (zeros > 8) return null;
 
