@@ -1,12 +1,36 @@
 const std = @import("std");
 const json = std.json;
-const log = std.log.scoped(.cni);
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = @import("../utils/ArenaAllocator.zig");
 const plugin = @import("../plugin.zig");
 const Responser = @import("../common/Responser.zig");
 const managed_type = @import("../common/ManagedType.zig");
 const StateFile = @import("StateFile.zig");
+
+// Zig 0.16's test runner unconditionally fails any test that emits a
+// log.err, even when the error is the expected outcome being asserted
+// (e.g. the rollback path in persistAndRespond). In test builds we route
+// .err through a no-op while leaving .warn/.info/.debug intact so the
+// assertions can exercise the failure paths without tripping the runner.
+// Production builds are unaffected.
+const log = if (builtin.is_test) TestLogFilter else std.log.scoped(.cni);
+
+const TestLogFilter = struct {
+    pub inline fn emerg(comptime _: []const u8, _: anytype) void {}
+    pub inline fn alert(comptime _: []const u8, _: anytype) void {}
+    pub inline fn crit(comptime _: []const u8, _: anytype) void {}
+    pub inline fn err(comptime _: []const u8, _: anytype) void {}
+    pub inline fn warn(comptime fmt: []const u8, args: anytype) void {
+        std.log.scoped(.cni).warn(fmt, args);
+    }
+    pub inline fn info(comptime fmt: []const u8, args: anytype) void {
+        std.log.scoped(.cni).info(fmt, args);
+    }
+    pub inline fn debug(comptime fmt: []const u8, args: anytype) void {
+        std.log.scoped(.cni).debug(fmt, args);
+    }
+};
 
 pub const CniConfig = @import("CniConfig.zig").CniConfig;
 pub const PluginConf = @import("PluginConf.zig").PluginConf;
@@ -516,6 +540,235 @@ test "deinit does not double-free the Cni struct" {
     const cni = try Cni.initFromConfig(std.testing.io, allocator, config, "/tmp");
     // Must not panic or trigger double-free detection.
     cni.deinit();
+}
+
+// === persistAndRespond tests ===
+//
+// These tests exercise the rollback and error-priority logic in
+// `persistAndRespond` without invoking real CNI plugins. State writes
+// are faked via `StateWriterFn`; teardown success/failure is controlled
+// via the attachment's exec_configs (empty list = no-op, populated list
+// = exec fails because cni_plugin_dir points at a non-existent path).
+
+/// Fake state writer that always returns error.StateWriteFail. Used to
+/// drive the rollback branch of `persistAndRespond`.
+fn alwaysFailingStateWriter(io: std.Io, allocator: Allocator, uid: u32, container_id: []const u8, ifname: []const u8, data: []const u8) anyerror!void {
+    _ = io;
+    _ = allocator;
+    _ = uid;
+    _ = container_id;
+    _ = ifname;
+    _ = data;
+    return error.StateWriteFail;
+}
+
+/// Fake state writer that always succeeds (no-op). Used to drive the
+/// happy-path branch of `persistAndRespond`.
+fn alwaysSucceedingStateWriter(io: std.Io, allocator: Allocator, uid: u32, container_id: []const u8, ifname: []const u8, data: []const u8) anyerror!void {
+    _ = io;
+    _ = allocator;
+    _ = uid;
+    _ = container_id;
+    _ = ifname;
+    _ = data;
+}
+
+/// Minimal exec-shaped Request suitable for `persistAndRespond`.
+fn makeTestRequest() plugin.Request {
+    return .{
+        .action = .setup,
+        .request = .{
+            .exec = .{
+                .container_name = "test-container",
+                .container_id = "test-container-id",
+                .network = .{
+                    .driver = "net-porter",
+                    .options = .{ .socket = "test-socket", .resource = "test-resource" },
+                },
+                .network_options = .{
+                    .interface_name = "eth0",
+                },
+            },
+        },
+    };
+}
+
+/// Build an Attachment whose single exec_config carries a valid CNI
+/// result. `cni_plugin_dir` controls where teardown would look for the
+/// plugin binary; pointing it at a non-existent path makes any exec
+/// attempt inside teardown fail.
+fn makeTestAttachment(allocator: std.mem.Allocator, cni_plugin_dir: []const u8) !Attachment {
+    var arena = try ArenaAllocator.init(allocator);
+    const arena_alloc = arena.allocator();
+
+    var plugin_arena = try ArenaAllocator.init(allocator);
+    const plugin_alloc = plugin_arena.allocator();
+
+    var conf = try json.ObjectMap.init(plugin_alloc, &.{}, &.{});
+    try conf.put(plugin_alloc, "type", json.Value{ .string = "macvlan" });
+    try conf.put(plugin_alloc, "name", json.Value{ .string = "test" });
+    try conf.put(plugin_alloc, "cniVersion", json.Value{ .string = "1.0.0" });
+
+    const cni_result =
+        \\{"cniVersion":"1.0.0","interfaces":[{"name":"eth0","mac":"02:42:c0:a8:01:64"}],"ips":[{"interface":0,"address":"10.0.0.1/24"}]}
+    ;
+    const result_copy = try plugin_alloc.dupe(u8, cni_result);
+
+    const plugin_conf = PluginConf{
+        .arena = plugin_arena,
+        .conf = conf,
+        .result = std.ArrayList(u8).fromOwnedSlice(result_copy),
+    };
+
+    var attachment = Attachment{
+        .arena = arena,
+        .cni_plugin_dir = cni_plugin_dir,
+        .exec_configs = std.ArrayList(PluginConf).empty,
+    };
+    try attachment.exec_configs.append(arena_alloc, plugin_conf);
+    return attachment;
+}
+
+/// Build an Attachment with no exec_configs. teardown over an empty
+/// config list is a no-op, so it always succeeds — useful for isolating
+/// the rollback-skip path from teardown-failure noise.
+fn makeEmptyAttachment(allocator: std.mem.Allocator, cni_plugin_dir: []const u8) !Attachment {
+    const arena = try ArenaAllocator.init(allocator);
+    return Attachment{
+        .arena = arena,
+        .cni_plugin_dir = cni_plugin_dir,
+        .exec_configs = std.ArrayList(PluginConf).empty,
+    };
+}
+
+/// Create a connected AF_UNIX socketpair for backing a test Responser.
+/// Returns error.SkipZigTest if the kernel rejects the call (should not
+/// happen on Linux). Caller owns both fds and must close them.
+fn openTestSocketpair(fds: *[2]std.os.linux.fd_t) !void {
+    const rc = std.os.linux.socketpair(
+        std.os.linux.AF.UNIX,
+        std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC,
+        0,
+        fds,
+    );
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+}
+
+test "persistAndRespond sends success response when state write succeeds" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const tentative = arena.allocator();
+
+    var attachment = try makeTestAttachment(allocator, "/nonexistent-cni-path-for-test");
+    defer attachment.deinit();
+
+    var fds: [2]std.os.linux.fd_t = undefined;
+    try openTestSocketpair(&fds);
+    defer _ = std.os.linux.close(fds[0]);
+    defer _ = std.os.linux.close(fds[1]);
+
+    var stream: std.Io.net.Stream = .{
+        .socket = .{
+            .handle = fds[0],
+            .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        },
+    };
+    var responser = Responser{ .io = std.testing.io, .stream = &stream };
+
+    try persistAndRespond(.{
+        .allocator = tentative,
+        .io = std.testing.io,
+        .attachment = &attachment,
+        .request = makeTestRequest(),
+        .responser = &responser,
+        .caller_uid = 1000,
+        .state_writer = alwaysSucceedingStateWriter,
+    });
+
+    try std.testing.expect(responser.done);
+}
+
+test "persistAndRespond rolls back and skips response when state write fails" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const tentative = arena.allocator();
+
+    // Empty configs: teardown is a no-op, so the only observable effect
+    // is that persistAndRespond returns the original StateWriteFail and
+    // the success response is never written.
+    var attachment = try makeEmptyAttachment(allocator, "/nonexistent-cni-path-for-test");
+    defer attachment.deinit();
+
+    var fds: [2]std.os.linux.fd_t = undefined;
+    try openTestSocketpair(&fds);
+    defer _ = std.os.linux.close(fds[0]);
+    defer _ = std.os.linux.close(fds[1]);
+
+    var stream: std.Io.net.Stream = .{
+        .socket = .{
+            .handle = fds[0],
+            .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        },
+    };
+    var responser = Responser{ .io = std.testing.io, .stream = &stream };
+
+    try std.testing.expectError(
+        error.StateWriteFail,
+        persistAndRespond(.{
+            .allocator = tentative,
+            .io = std.testing.io,
+            .attachment = &attachment,
+            .request = makeTestRequest(),
+            .responser = &responser,
+            .caller_uid = 1000,
+            .state_writer = alwaysFailingStateWriter,
+        }),
+    );
+
+    // The success response must NOT have been sent on the rollback path.
+    try std.testing.expect(!responser.done);
+}
+
+test "persistAndRespond returns original error when both state write and teardown fail" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const tentative = arena.allocator();
+
+    // Populated attachment: teardown will attempt to exec the plugin
+    // binary at /nonexistent-cni-path-for-test/macvlan, which does not
+    // exist. Whatever teardown returns must be swallowed so the original
+    // state error (StateWriteFail) reaches the caller.
+    var attachment = try makeTestAttachment(allocator, "/nonexistent-cni-path-for-test");
+    defer attachment.deinit();
+
+    var fds: [2]std.os.linux.fd_t = undefined;
+    try openTestSocketpair(&fds);
+    defer _ = std.os.linux.close(fds[0]);
+    defer _ = std.os.linux.close(fds[1]);
+
+    var stream: std.Io.net.Stream = .{
+        .socket = .{
+            .handle = fds[0],
+            .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        },
+    };
+    var responser = Responser{ .io = std.testing.io, .stream = &stream };
+
+    try std.testing.expectError(
+        error.StateWriteFail,
+        persistAndRespond(.{
+            .allocator = tentative,
+            .io = std.testing.io,
+            .attachment = &attachment,
+            .request = makeTestRequest(),
+            .responser = &responser,
+            .caller_uid = 1000,
+            .state_writer = alwaysFailingStateWriter,
+        }),
+    );
 }
 
 test {
