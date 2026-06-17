@@ -9,7 +9,7 @@ pub fn ManagedType(comptime T: type) type {
         const Self = @This();
 
         pub fn deinit(self: *Self) void {
-            if (@hasDecl(T, "deinit") and @typeInfo(@TypeOf(T.deinit)) == .Fn) {
+            if (@hasDecl(T, "deinit") and @typeInfo(@TypeOf(T.deinit)) == .@"fn") {
                 self.v.deinit();
             }
 
