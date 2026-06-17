@@ -87,8 +87,14 @@ test "log" {
         try std.testing.expect(std.mem.indexOf(u8, infoLog, "info(") != null);
         // Warn must never leak into the info buffer
         try std.testing.expect(std.mem.indexOf(u8, infoLog, "warning(") == null);
-        // Log line starts with the timestamp prefix "<n>ms "
-        try std.testing.expect(std.mem.indexOf(u8, infoLog, "ms ") != null);
+        // Log line starts with the timestamp prefix "<digits>ms ". Verify the
+        // buffer begins with a digit and "ms " is immediately preceded by a
+        // digit, rather than just looking for the bare substring "ms " which
+        // could match inside a message body.
+        const info_ms_pos = std.mem.indexOf(u8, infoLog, "ms ") orelse 0;
+        try std.testing.expect(info_ms_pos > 0);
+        try std.testing.expect(std.ascii.isDigit(infoLog[0]));
+        try std.testing.expect(std.ascii.isDigit(infoLog[info_ms_pos - 1]));
     }
 
     {
@@ -107,8 +113,13 @@ test "log" {
         try std.testing.expect(std.mem.indexOf(u8, warnLog, "warning(") != null);
         // Info must never leak into the warn buffer
         try std.testing.expect(std.mem.indexOf(u8, warnLog, "info(") == null);
-        // Log line starts with the timestamp prefix "<n>ms "
-        try std.testing.expect(std.mem.indexOf(u8, warnLog, "ms ") != null);
+        // Log line starts with the timestamp prefix "<digits>ms ". See the
+        // info-buffer block above for why we assert digit boundaries rather
+        // than the bare substring "ms ".
+        const warn_ms_pos = std.mem.indexOf(u8, warnLog, "ms ") orelse 0;
+        try std.testing.expect(warn_ms_pos > 0);
+        try std.testing.expect(std.ascii.isDigit(warnLog[0]));
+        try std.testing.expect(std.ascii.isDigit(warnLog[warn_ms_pos - 1]));
     }
 
     temp_file_manager.should_clean_file = true;
