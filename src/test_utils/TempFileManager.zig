@@ -72,7 +72,9 @@ pub fn deinit(self: *TempFileManager) void {
     self.temp_dir.close(self.io);
 
     if (self.should_clean_file) {
-        std.Io.Dir.cwd().deleteDir(self.io, self.temp_dir_path) catch {};
+        // deleteTree recursively removes files and subdirectories so a future
+        // test that drops files directly into temp_dir_path won't leak.
+        std.Io.Dir.cwd().deleteTree(self.io, self.temp_dir_path) catch {};
     }
     self.allocator.free(self.temp_dir_path);
 }
