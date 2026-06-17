@@ -14,6 +14,9 @@ const StateFile = @import("StateFile.zig");
 // .err through a no-op while leaving .warn/.info/.debug intact so the
 // assertions can exercise the failure paths without tripping the runner.
 // Production builds are unaffected.
+// WARNING: This filter silences ALL cni-scope error logs in test builds.
+// New cni tests must not rely on log.err causing failure; verify error
+// paths through return values and responser state instead.
 const log = if (builtin.is_test) TestLogFilter else std.log.scoped(.cni);
 
 const TestLogFilter = struct {
@@ -769,6 +772,7 @@ test "persistAndRespond returns original error when both state write and teardow
             .state_writer = alwaysFailingStateWriter,
         }),
     );
+    try std.testing.expect(!responser.done);
 }
 
 test {
