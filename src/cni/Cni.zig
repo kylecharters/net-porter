@@ -129,6 +129,97 @@ pub fn responseResult(allocator: Allocator, responser: *Responser, stdout: std.A
     responser.write(managed_response.v);
 }
 
+/// Function signature for the state-write dependency used by
+/// `persistAndRespond`. Production code passes `StateFile.write`; tests
+/// inject a fake to simulate persistence failure without touching the real
+/// `/run/net-porter/...` filesystem path. The injected function lives in
+/// production code (declared here) but is only invoked with non-default
+/// arguments from tests.
+pub const StateWriterFn = *const fn (
+    io: std.Io,
+    allocator: Allocator,
+    uid: u32,
+    container_id: []const u8,
+    ifname: []const u8,
+    data: []const u8,
+) anyerror!void;
+
+/// Argument bundle for `persistAndRespond`. Groups the 7 dependencies so the
+/// signature stays readable and the call site is self-documenting.
+pub const PersistAndRespondArgs = struct {
+    allocator: Allocator,
+    io: std.Io,
+    attachment: *Attachment,
+    request: plugin.Request,
+    responser: *Responser,
+    caller_uid: u32,
+    state_writer: StateWriterFn,
+};
+
+/// Persist attachment state and emit the success response after CNI ADD has
+/// completed. This helper exists to guarantee the response-timing invariant
+/// at the heart of the CNI ADD flow:
+///
+///   1. The success response is sent ONLY after `state_writer` succeeds.
+///   2. If `state_writer` fails, the just-allocated network is rolled back
+///      via `Attachment.teardown` and the ORIGINAL state error is propagated.
+///      The success response is NOT sent, so `Handler.handle` (which checks
+///      `responser.done`) will emit an error response that truthfully reports
+///      the failure to the client.
+///   3. If rollback also fails, the rollback error is logged but suppressed
+///      so the caller sees the original state error (the root cause).
+///
+/// Decoupling this logic from `Cni.setup` enables targeted unit tests:
+/// `state_writer` is injectable, so tests can exercise both branches without
+/// running real CNI plugins or touching the real state directory.
+pub fn persistAndRespond(args: PersistAndRespondArgs) !void {
+    const exec_request = try args.request.requestExec();
+    const container_id = exec_request.container_id;
+    const ifname = exec_request.network_options.interface_name;
+
+    const state_json = try args.attachment.serializeState(args.allocator);
+    defer args.allocator.free(state_json);
+
+    args.state_writer(args.io, args.allocator, args.caller_uid, container_id, ifname, state_json) catch |err| {
+        log.err(
+            "Failed to persist state for uid={d}, container_id={s}: {s}; rolling back CNI ADD",
+            .{ args.caller_uid, container_id, @errorName(err) },
+        );
+        // State persistence failed after a successful CNI ADD. Attempt
+        // rollback by issuing CNI DEL; otherwise the just-allocated network
+        // resources (interfaces, IPs, firewall rules) would be orphaned with
+        // no state file to drive a future teardown.
+        //
+        // IMPORTANT: the success response has NOT been sent yet — it is sent
+        // only after state persistence succeeds below. The Handler will see
+        // responser.done == false and emit an error response to the client,
+        // which correctly reflects the failed setup.
+        args.attachment.teardown(args.io, args.allocator, args.request, args.responser) catch |rollback_err| {
+            log.err(
+                "Rollback (CNI DEL) also failed for uid={d}, container_id={s}: {s}; resources may be orphaned and require manual cleanup",
+                .{ args.caller_uid, container_id, @errorName(rollback_err) },
+            );
+        };
+        return err;
+    };
+
+    // State persisted — now it is safe to report success to the client.
+    // A failure here (e.g. JSON formatting) is logged and propagated, but the
+    // network IS set up and the state file IS persisted, so a subsequent
+    // teardown by the client will succeed even if this response is lost.
+    responseResult(
+        args.allocator,
+        args.responser,
+        args.attachment.finalResult(.last) orelse return error.NoExecConfigs,
+    ) catch |err| {
+        log.err(
+            "Failed to format success response for uid={d}, container_id={s}: {s}; network is set up and state is persisted",
+            .{ args.caller_uid, container_id, @errorName(err) },
+        );
+        return err;
+    };
+}
+
 // Import Attachment after all types it depends on are declared above
 const Attachment = @import("Attachment.zig").Attachment;
 
@@ -227,27 +318,19 @@ pub fn setup(self: *Cni, tentative_allocator: Allocator, request: plugin.Request
     // Execute CNI ADD chain with prevResult chaining between plugins
     try attachment.setup(self.io, tentative_allocator, request, responser);
 
-    // Persist state on success: store the attachment's exec configs and final result
-    const state_json = try attachment.serializeState(tentative_allocator);
-    defer tentative_allocator.free(state_json);
-
-    StateFile.write(self.io, tentative_allocator, caller_uid, container_id, ifname, state_json) catch |err| {
-        log.err(
-            "Failed to persist state for uid={d}, container_id={s}: {s}; rolling back CNI ADD",
-            .{ caller_uid, container_id, @errorName(err) },
-        );
-        // State persistence failed after a successful CNI ADD. Attempt
-        // rollback by issuing CNI DEL; otherwise the just-allocated network
-        // resources (interfaces, IPs, firewall rules) would be orphaned with
-        // no state file to drive a future teardown.
-        attachment.teardown(self.io, tentative_allocator, request, responser) catch |rollback_err| {
-            log.err(
-                "Rollback (CNI DEL) also failed for uid={d}, container_id={s}: {s}; resources may be orphaned and require manual cleanup",
-                .{ caller_uid, container_id, @errorName(rollback_err) },
-            );
-        };
-        return err;
-    };
+    // Persist state and emit the success response. On state-write failure
+    // this rolls back the just-completed CNI ADD via teardown and returns
+    // the original error; the success response is NOT sent, so Handler
+    // will emit an error response that truthfully reports the failure.
+    try persistAndRespond(.{
+        .allocator = tentative_allocator,
+        .io = self.io,
+        .attachment = &attachment,
+        .request = request,
+        .responser = responser,
+        .caller_uid = caller_uid,
+        .state_writer = StateFile.write,
+    });
 }
 
 pub fn teardown(self: *Cni, tentative_allocator: Allocator, request: plugin.Request, responser: *Responser, caller_uid: std.posix.uid_t) !void {

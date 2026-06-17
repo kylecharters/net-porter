@@ -12,7 +12,6 @@ const max_stderr_log = @import("PluginConf.zig").max_stderr_log;
 const shadowCopy = @import("PluginConf.zig").shadowCopy;
 const CniCommand = @import("Cni.zig").CniCommand;
 const responseError = @import("Cni.zig").responseError;
-const responseResult = @import("Cni.zig").responseResult;
 const isValidPluginType = @import("CniLoader.zig").isValidPluginType;
 const SlaacDetector = @import("SlaacDetector.zig");
 
@@ -185,7 +184,7 @@ pub const Attachment = struct {
 
     const FinalResultPos = enum { first, last };
 
-    fn finalResult(self: Attachment, pos: FinalResultPos) ?std.ArrayList(u8) {
+    pub fn finalResult(self: Attachment, pos: FinalResultPos) ?std.ArrayList(u8) {
         const len = self.exec_configs.items.len;
         if (len == 0) {
             return null;
@@ -211,6 +210,14 @@ pub const Attachment = struct {
         // In the per-user daemon architecture, the worker runs inside the
         // container's mount namespace. The netns path from the request is
         // directly usable — no fd passing or resolution needed.
+        //
+        // This function executes the CNI ADD plugin chain and writes error
+        // responses for plugin failures (timeout, non-zero exit) via
+        // responser.writeError. It does NOT send the success response: the
+        // success response is deferred to the caller (Cni.setup), which only
+        // emits it after StateFile.write succeeds. This ordering guarantee is
+        // critical — if state persistence fails and the attachment is rolled
+        // back, the client must NOT receive a misleading success response.
         const netns: []const u8 = request.netns orelse "/proc/self/ns/net";
 
         var env_map = try self.envMap(tentative_allocator, .ADD, request, netns);
@@ -309,11 +316,6 @@ pub const Attachment = struct {
         }
 
         log.info("Setup {s} success", .{request.request.exec.container_name});
-        try responseResult(
-            tentative_allocator,
-            responser,
-            self.finalResult(.last) orelse return error.NoExecConfigs,
-        );
     }
 
     pub fn teardown(self: *Attachment, io: std.Io, tentative_allocator: Allocator, request: plugin.Request, responser: *Responser) !void {
