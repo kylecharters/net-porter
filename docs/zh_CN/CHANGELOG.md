@@ -5,6 +5,40 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.5.1] - 2026-06-17
+
+### 安全
+
+- **加固 Domain Socket 符号链接 TOCTOU 防护**：`DomainSocket` 的 chmod 和 `setModePath` 现在拒绝符号链接路径，防止攻击者通过符号链接替换将 chmod 重定向到受控文件。
+- **env 文件原子写入**：env 文件现在以 `O_EXCL | O_NOFOLLOW | O_CLOEXEC` 创建，先 `fsync` 到临时文件再 `rename` 落地。该机制防止半写损坏，并抵御共享目录上的符号链接拦截。
+- **加固 `CniLoader.isValidPluginType` 路径遍历校验**：插件类型校验现在更严格地拒绝遍历序列，封堵畸形 CNI 配置引用意外路径的缺口。
+- **MAC/IP 范围解析校验**：范围解析器现在更严格地校验输入，提前拒绝畸形或逆序范围，避免其进入 ACL 强制执行阶段。
+
+### 修复
+
+- **关键：CNI ADD 成功响应不再在状态持久化之前发出**：CNI ADD 的成功响应现在推迟到附件状态文件持久化成功之后才返回。此前，网络挂载成功但状态文件写入失败时，调用方会收到"成功"响应，而实际网络已被回滚，造成状态不一致。
+- **CNI ADD 状态持久化失败时回滚**：网络已挂载但状态文件写入失败时，刚挂载的网络现在会被拆除，不再作为孤儿资源残留。
+- **Zig 0.16 `@typeInfo` 标签兼容性**：`ManagedType` 中的 `@typeInfo` 标签访问已更新（`.Fn` → `.@"fn"`），与 Zig 0.16 中重命名的标签保持一致，避免在新工具链上的潜在编译中断。
+
+### 变更
+
+- **CNI ADD 失败契约**：状态持久化失败时，Worker 现在回滚网络并返回错误，不再留下孤儿网络并报告成功。
+- **Responser flush 失败处理**：首次响应 flush 失败时，Worker 不再尝试二次写入错误响应（那会拼接出非法的 JSON 文档），改为记录 warning 并干净地放弃。
+- **`WorkerManager.workers_dir` 改为依赖注入**：移除了 `is_test` 编译期分支，生产与测试统一注入目录。测试通过 `TempFileManager` 提供隔离目录。
+
+### 性能
+
+- **UID 查找改用二分搜索**：`UidTracker` 现在通过二分搜索解析 UID，取代线性扫描，降低随用户数增长的单次请求开销。
+
+### 内部优化
+
+- 移除 6 处弱断言/造假测试，改用真实断言，恢复有意义的覆盖率。
+- 新增 CNI ADD 回滚路径与 Responser flush 失败路径的测试。
+- `TempFileManager` 改用 `deleteTree` 递归清理临时目录。
+- 这是一个 patch 发布，聚焦于加固、韧性和测试质量改进。无公开 API 变更。
+
+---
+
 ## [1.5.0] - 2026-06-12
 
 ### 新增
@@ -351,6 +385,7 @@
 
 _初始公开发布，采用每用户服务架构。_
 
+[1.5.1]: https://github.com/a-light-win/net-porter/compare/1.5.0...1.5.1
 [1.5.0]: https://github.com/a-light-win/net-porter/compare/1.4.0...1.5.0
 [1.4.0]: https://github.com/a-light-win/net-porter/compare/1.3.0...1.4.0
 [1.3.0]: https://github.com/a-light-win/net-porter/compare/1.2.0...1.3.0

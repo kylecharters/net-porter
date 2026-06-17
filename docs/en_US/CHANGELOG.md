@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-06-17
+
+### Security
+
+- **Symlink TOCTOU hardening for domain sockets**: `DomainSocket` chmod and `setModePath` now reject symlinked socket paths, preventing symlink-swap races that could redirect chmod onto an attacker-controlled file.
+- **Atomic env file writes**: Environment files are now written using `O_EXCL | O_NOFOLLOW | O_CLOEXEC`, with content `fsync`-ed to a temp file before `rename` into place. This prevents partial-write corruption and resists symlink interception on shared directories.
+- **Path traversal validation hardened in `CniLoader.isValidPluginType`**: Plugin type validation now rejects traversal sequences more strictly, closing gaps where malformed CNI configs could reference unexpected paths.
+- **MAC and IP range parsing validation**: Range parsers now validate inputs more strictly, rejecting malformed or out-of-order ranges early before they reach ACL enforcement.
+
+### Fixed
+
+- **Critical: CNI ADD success no longer reported before state is durable**: The CNI ADD success response is now deferred until the attachment state file has been persisted successfully. Previously, a state-write failure after a successful network mount could leave the caller with a "success" response while the network had effectively been rolled back — an inconsistent state.
+- **CNI ADD rolls back on state persistence failure**: When writing the state file fails after a network has been attached, the just-mounted network is now torn down instead of being left as an orphan resource.
+- **Zig 0.16 `@typeInfo` tag compatibility**: Updated `@typeInfo` tag access (`.Fn` → `.@"fn"`) in `ManagedType` to match the renamed tag in Zig 0.16, avoiding a latent compile breakage against newer toolchains.
+
+### Changed
+
+- **CNI ADD failure contract**: On state-persistence failure the worker now rolls back the network and returns an error, rather than leaving an orphan network and reporting success.
+- **Responser flush failure handling**: When the initial response flush fails, the worker no longer attempts a second error-response write (which would produce an invalid concatenated JSON document). It now logs a warning and gives up cleanly.
+- **`WorkerManager.workers_dir` is now dependency-injected**: The `is_test` comptime branch has been removed; production and tests both inject the directory. Tests use `TempFileManager` to provide an isolated directory.
+
+### Performance
+
+- **UID lookup uses binary search**: `UidTracker` now resolves UIDs via binary search instead of a linear scan, reducing per-request cost as the number of tracked users grows.
+
+### Internal
+
+- Replaced six weak/fake assertions with real assertions, restoring meaningful coverage.
+- Added tests covering the CNI ADD rollback path and the Responser flush-failure path.
+- `TempFileManager` now uses `deleteTree` for recursive cleanup of temporary directories.
+- This is a patch release focused on hardening, resilience, and test-quality improvements. No public API changes.
+
+---
+
 ## [1.5.0] - 2026-06-12
 
 ### Added
@@ -352,6 +386,7 @@ See the [Migration Guide (0.4 → 0.5)](migration-guide-0.4-to-0.5.md) for step-
 
 _Initial public release with per-user service architecture._
 
+[1.5.1]: https://github.com/a-light-win/net-porter/compare/1.5.0...1.5.1
 [1.5.0]: https://github.com/a-light-win/net-porter/compare/1.4.0...1.5.0
 [1.4.0]: https://github.com/a-light-win/net-porter/compare/1.3.0...1.4.0
 [1.3.0]: https://github.com/a-light-win/net-porter/compare/1.2.0...1.3.0
