@@ -548,8 +548,10 @@ pub const PluginConf = struct {
         defer allocator.free(buf);
 
         try std.testing.expect(buf.len > 0);
-        // Key fields from the input config must round-trip through stringify
-        try std.testing.expect(std.mem.indexOf(u8, buf, "cniVersion") != null);
+        // Key fields from the input config must round-trip through stringify.
+        // All field-name assertions use the quoted JSON key form so a value
+        // substring (e.g. "name" inside another field) cannot false-match.
+        try std.testing.expect(std.mem.indexOf(u8, buf, "\"cniVersion\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, buf, "\"name\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, buf, "\"type\"") != null);
         // Verify the actual values survive the round-trip
