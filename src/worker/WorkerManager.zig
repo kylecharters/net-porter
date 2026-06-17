@@ -182,6 +182,13 @@ pub fn getWorkerUsername(self: *WorkerManager, uid: u32) ?[]const u8 {
 
 /// Test helper: inject a fake worker entry directly into the workers map.
 /// Caller owns `username` memory; it will be freed when the worker is stopped or deinit'd.
+///
+/// NOTE: this helper exists only for Server-side tests that need to populate
+/// worker state (e.g. ACL-change handling). The injected `pid`/`pidfd`/
+/// `catatonit_pidfd` are sentinel values (100/-1/200/-1) — `rebuildMonitoredFds`
+/// is invoked so the monitored-fd list stays in sync, but this path does NOT
+/// exercise real pidfd_open / process verification. Tests that need to
+/// validate pidfd behaviour should go through the real spawn path instead.
 pub fn injectTestWorker(self: *WorkerManager, uid: u32, username: []const u8) !void {
     self.mutex.lock(self.io) catch return error.LockFailed;
     defer self.mutex.unlock(self.io);
