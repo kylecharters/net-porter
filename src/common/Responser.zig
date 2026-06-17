@@ -90,3 +90,69 @@ pub fn write(self: *Responser, response: anytype) void {
         file_writer.end() catch {};
     }
 }
+
+// === flush-failure tests ===
+//
+// write() must always converge to `done == true` even when the underlying
+// stream is broken (peer closed). A flush failure on the bytes path is
+// logged and suppressed; on the JSON path it is also logged and suppressed.
+// Neither path may panic or leave `done == false`, otherwise Handler.handle
+// would emit a spurious second response.
+
+/// Create a connected AF_UNIX socketpair. Returns error.SkipZigTest if the
+/// kernel rejects the call. Caller owns both fds and must close them.
+fn openTestSocketpair(fds: *[2]std.os.linux.fd_t) !void {
+    const rc = std.os.linux.socketpair(
+        std.os.linux.AF.UNIX,
+        std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC,
+        0,
+        fds,
+    );
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+}
+
+test "Responser write bytes handles flush failure" {
+    var fds: [2]std.os.linux.fd_t = undefined;
+    try openTestSocketpair(&fds);
+    defer _ = std.os.linux.close(fds[0]);
+
+    // Close the peer so the subsequent flush on fds[0] fails (EPIPE /
+    // ECONNRESET). write() must not panic and must mark itself done.
+    _ = std.os.linux.close(fds[1]);
+
+    var stream: std.Io.net.Stream = .{
+        .socket = .{
+            .handle = fds[0],
+            .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        },
+    };
+    var responser = Responser{ .io = std.testing.io, .stream = &stream };
+
+    responser.write("some success response");
+
+    try std.testing.expect(responser.done);
+}
+
+test "Responser write json handles flush failure" {
+    var fds: [2]std.os.linux.fd_t = undefined;
+    try openTestSocketpair(&fds);
+    defer _ = std.os.linux.close(fds[0]);
+    _ = std.os.linux.close(fds[1]);
+
+    var stream: std.Io.net.Stream = .{
+        .socket = .{
+            .handle = fds[0],
+            .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        },
+    };
+    var responser = Responser{ .io = std.testing.io, .stream = &stream };
+
+    // A small JSON value: stringify fills the buffer, flush fails because
+    // the peer was closed. done must be set so Handler does not re-emit.
+    responser.write(json.Value{ .string = "ok" });
+
+    try std.testing.expect(responser.done);
+    // Flush failure on the success path is logged, not promoted to an
+    // error response — is_error must stay false.
+    try std.testing.expect(!responser.is_error);
+}
