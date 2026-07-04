@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.5.2] - 2026-07-04
+
+### 修复
+
+- **用户重建后 Worker 不重启**：当用户 session 结束（如服务卸载期间）且 ACL 扫描器暂时无法将用户名解析为 UID 时，该 UID 会从允许列表中移除。当用户被重建（如重新部署）时，Worker 不会重启，因为 UID 已不在允许列表中，且 ACL 文件没有变更触发重扫描。服务器现在会跟踪 ACL 扫描期间解析失败的用户名，当 `/run/user/<uid>` 目录出现且 UID 不在允许列表中时，执行反向查找（UID → 用户名）并与未解析列表比对。如果匹配成功，触发 ACL 重扫描，将 UID 恢复到允许列表并启动 Worker。
+
+### 变更
+
+- **UidTracker 报告 pending UID**：`UidEvents` 现在包含 `pending` 列表，记录 `/run/user/<uid>` 目录已创建但不在允许列表中的 UID。服务器利用此信息检测暂时无法解析的 ACL 用户。
+- **AclScanner 跟踪未解析用户名**：新增 `scanUidsWithUnresolved()` 方法，同时返回已解析的 UID 和无法解析为 UID 的用户名，使服务器能够在用户重新出现时重试解析。
+- **handleAclChange 现在调用 scanExisting**：更新允许 UID 列表后，重新扫描已有的 `/run/user/` 目录，使新允许的 UID 如果已有活跃 session，能立即被追踪并启动 Worker。
+
+---
+
 ## [1.5.1] - 2026-06-17
 
 ### 安全
@@ -385,6 +399,7 @@
 
 _初始公开发布，采用每用户服务架构。_
 
+[1.5.2]: https://github.com/a-light-win/net-porter/compare/1.5.1...1.5.2
 [1.5.1]: https://github.com/a-light-win/net-porter/compare/1.5.0...1.5.1
 [1.5.0]: https://github.com/a-light-win/net-porter/compare/1.4.0...1.5.0
 [1.4.0]: https://github.com/a-light-win/net-porter/compare/1.3.0...1.4.0
