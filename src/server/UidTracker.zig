@@ -29,6 +29,11 @@ pub const event_buffer_size: usize = 32 * 1024;
 pub const UidEvents = struct {
     created: std.ArrayList(u32),
     removed: std.ArrayList(u32),
+    /// UIDs whose `/run/user/<uid>` directory was created while the UID was not
+    /// in the allowed list. The caller may resolve them to usernames and check
+    /// whether they correspond to a previously-unresolved ACL entry, in which
+    /// case an ACL re-scan can recover the worker.
+    pending: std.ArrayList(u32),
     /// Set when an `IN_Q_OVERFLOW` event was observed. Indicates events may
     /// have been lost; the caller should perform a full re-scan to reconcile.
     rescan_needed: bool = false,
@@ -36,6 +41,7 @@ pub const UidEvents = struct {
     pub fn deinit(self: *UidEvents, allocator: Allocator) void {
         self.created.deinit(allocator);
         self.removed.deinit(allocator);
+        self.pending.deinit(allocator);
     }
 };
 
@@ -264,22 +270,27 @@ pub fn isUidActive(self: UidTracker, uid: u32) bool {
 /// Returns UIDs that appeared/disappeared.
 pub fn processInotifyEvents(self: *UidTracker, event_buf: []u8) UidEvents {
     const max_events = event_buf.len / @sizeOf(std.os.linux.inotify_event);
-    var created = std.ArrayList(u32).initCapacity(self.allocator, max_events) catch return .{ .created = .empty, .removed = .empty };
+    var created = std.ArrayList(u32).initCapacity(self.allocator, max_events) catch return .{ .created = .empty, .removed = .empty, .pending = .empty };
     var removed = std.ArrayList(u32).initCapacity(self.allocator, max_events) catch {
         created.deinit(self.allocator);
-        return .{ .created = .empty, .removed = .empty };
+        return .{ .created = .empty, .removed = .empty, .pending = .empty };
+    };
+    var pending = std.ArrayList(u32).initCapacity(self.allocator, max_events) catch {
+        created.deinit(self.allocator);
+        removed.deinit(self.allocator);
+        return .{ .created = .empty, .removed = .empty, .pending = .empty };
     };
     var rescan_needed = false;
 
     while (true) {
         const n = std.posix.read(self.inotify_fd, event_buf) catch |err| switch (err) {
-            error.WouldBlock => return .{ .created = created, .removed = removed, .rescan_needed = rescan_needed },
+            error.WouldBlock => return .{ .created = created, .removed = removed, .pending = pending, .rescan_needed = rescan_needed },
             else => {
                 log.warn("Failed to read inotify events: {s}", .{@errorName(err)});
-                return .{ .created = created, .removed = removed, .rescan_needed = rescan_needed };
+                return .{ .created = created, .removed = removed, .pending = pending, .rescan_needed = rescan_needed };
             },
         };
-        if (n == 0) return .{ .created = created, .removed = removed, .rescan_needed = rescan_needed };
+        if (n == 0) return .{ .created = created, .removed = removed, .pending = pending, .rescan_needed = rescan_needed };
 
         var offset: usize = 0;
         while (offset < n) {
@@ -309,6 +320,13 @@ pub fn processInotifyEvents(self: *UidTracker, event_buf: []u8) UidEvents {
                     log.info("Detected new /run/user/{d} directory", .{uid});
                     self.addUid(uid) catch continue;
                     created.appendAssumeCapacity(uid);
+                } else {
+                    // UID not in the allowed list yet. Surface it as pending so
+                    // the caller can check whether it matches a previously
+                    // unresolved ACL username (e.g. a user that was just
+                    // recreated) and trigger an ACL re-scan.
+                    log.info("UID {d} not in allowed list, adding to pending", .{uid});
+                    pending.appendAssumeCapacity(uid);
                 }
             } else if (event.mask & (inotify.IN_DELETE | inotify.IN_MOVED_FROM) != 0) {
                 log.info("Detected removal of /run/user/{d} directory", .{uid});

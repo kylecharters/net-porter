@@ -17,6 +17,11 @@ acl_watcher: AclWatcher,
 worker_manager: WorkerManager,
 uid_tracker: UidTracker,
 managed_config: config_mod.ManagedConfig,
+/// Usernames from ACL files that could not be resolved to a UID at the last
+/// scan (the user did not exist in NSS). Used to recover workers when a user
+/// is (re)created and its `/run/user/<uid>` appears. Keys are owned by the
+/// map and freed in `deinit` / replaced in `handleAclChange`.
+unresolved_usernames: std.StringHashMap(void),
 
 pub const Opts = struct {
     config_path: ?[]const u8 = null,
@@ -52,16 +57,36 @@ pub fn new(opts: Opts) !Server {
     // Scan ACL directory for allowed UIDs (username → UID resolution)
     var acl_manager = AclScanner.init(allocator, conf.acl_dir);
 
-    var allowed_uids = acl_manager.scanUids(io);
-    log.info("ACL scan: {} allowed UIDs", .{allowed_uids.items.len});
+    var initial_scan = acl_manager.scanUidsWithUnresolved(io);
+    log.info("ACL scan: {} allowed UIDs, {} unresolved usernames", .{ initial_scan.uids.items.len, initial_scan.unresolved.items.len });
 
-    // UidTracker.init takes ownership of allowed_uids on success. Use errdefer
-    // (not defer) so the list is freed only on the error path — if init
-    // succeeds, ownership transfers to the tracker and a defer would
+    // UidTracker.init takes ownership of initial_scan.uids on success. Use
+    // errdefer (not defer) so the list is freed only on the error path — if
+    // init succeeds, ownership transfers to the tracker and a defer would
     // double-free when the server is later deinit'd.
-    errdefer allowed_uids.deinit(allocator);
+    errdefer initial_scan.uids.deinit(allocator);
 
-    var uid_tracker = try UidTracker.init(io, allocator, allowed_uids);
+    // Seed unresolved_usernames from the initial scan so pending-UID recovery
+    // works before the first ACL-directory change event. Keys are owned by
+    // the map (duped from the scan's owned strings).
+    var unresolved_usernames = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var it = unresolved_usernames.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        unresolved_usernames.deinit();
+    }
+    for (initial_scan.unresolved.items) |name| {
+        const owned = allocator.dupe(u8, name) catch continue;
+        unresolved_usernames.put(owned, {}) catch {
+            allocator.free(owned);
+        };
+    }
+    // The scan's unresolved strings are no longer needed; the map holds its
+    // own copies now.
+    for (initial_scan.unresolved.items) |name| allocator.free(name);
+    initial_scan.unresolved.deinit(allocator);
+
+    var uid_tracker = try UidTracker.init(io, allocator, initial_scan.uids);
 
     uid_tracker.scanExisting(io);
 
@@ -87,6 +112,7 @@ pub fn new(opts: Opts) !Server {
         .worker_manager = worker_manager,
         .uid_tracker = uid_tracker,
         .managed_config = managed_config,
+        .unresolved_usernames = unresolved_usernames,
     };
 }
 
@@ -94,6 +120,12 @@ pub fn deinit(self: *Server) void {
     log.info("Server shutting down...", .{});
     self.acl_watcher.deinit();
     self.worker_manager.deinit();
+    // Free unresolved_usernames keys then deinit the map. Done before
+    // uid_tracker.deinit for clarity (the allocator itself is not owned by the
+    // tracker, so accessing self.uid_tracker.allocator here is still valid).
+    var it = self.unresolved_usernames.keyIterator();
+    while (it.next()) |key| self.uid_tracker.allocator.free(key.*);
+    self.unresolved_usernames.deinit();
     self.uid_tracker.deinit();
     self.managed_config.deinit();
 }
@@ -229,6 +261,16 @@ pub fn run(self: *Server, opts: RunOpts) !void {
             for (uid_events.removed.items) |uid| {
                 self.worker_manager.stopWorker(uid);
             }
+            // Pending UIDs: `/run/user/<uid>` appeared while the UID was not in
+            // the allowed list. If the UID now resolves to a username we
+            // previously failed to resolve from an ACL file, the user was
+            // likely (re)created — re-scan ACLs so the UID is re-added to the
+            // allowed list and its worker starts.
+            if (uid_events.pending.items.len > 0) {
+                if (self.processPendingUids(uid_events.pending.items)) {
+                    self.handleAclChange();
+                }
+            }
             // IN_Q_OVERFLOW: kernel dropped events, so created/removed may be
             // incomplete. Reconcile by re-scanning /run/user/ for allowed UIDs
             // (picks up missed additions) and re-syncing the worker set with
@@ -262,24 +304,70 @@ fn syncWorkers(self: *Server) void {
     self.worker_manager.ensureWorkers(active_uids.items);
 }
 
+/// Free the owned key strings of `unresolved_usernames` and clear the map
+/// without releasing its allocated capacity (the map is about to be repopulated
+/// or torn down by the caller).
+fn clearUnresolvedUsernames(self: *Server) void {
+    var it = self.unresolved_usernames.keyIterator();
+    while (it.next()) |key| self.uid_tracker.allocator.free(key.*);
+    self.unresolved_usernames.clearRetainingCapacity();
+}
+
+/// Inspect pending UIDs (whose `/run/user/<uid>` appeared while the UID was not
+/// yet allowed) and check whether any resolves to a username we previously
+/// failed to resolve from an ACL file. Returns true when at least one pending
+/// UID matches, signalling the caller to re-scan ACLs.
+fn processPendingUids(self: *Server, pending: []const u32) bool {
+    for (pending) |uid| {
+        const maybe_name = user_mod.getUsername(self.uid_tracker.allocator, uid) catch continue;
+        const username = maybe_name orelse continue;
+        defer self.uid_tracker.allocator.free(username);
+        if (self.unresolved_usernames.contains(username)) {
+            log.info("UID {d} ('{s}') matches unresolved ACL entry, triggering ACL re-scan", .{ uid, username });
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Handle a detected change in the ACL directory.
 /// Re-scans UIDs, updates the allowed list, and starts/stops workers as needed.
 /// Detects UID reuse: if a username-to-UID mapping changed, stops the old worker
 /// so it gets respawned with the correct username and ACL.
 fn handleAclChange(self: *Server) void {
-    var new_uids = self.acl_manager.scanUids(self.io);
+    var scan_result = self.acl_manager.scanUidsWithUnresolved(self.io);
 
     // Guard: if scan returns empty but old list was non-empty, assume
     // transient failure (e.g. ACL directory temporarily unavailable).
     // This prevents wiping all workers due to a fleeting I/O error.
-    if (new_uids.items.len == 0 and self.uid_tracker.allowed_uids.items.len > 0) {
+    if (scan_result.uids.items.len == 0 and self.uid_tracker.allowed_uids.items.len > 0) {
         log.warn("ACL scan returned empty but {} UIDs were allowed, skipping update (possible transient failure)", .{self.uid_tracker.allowed_uids.items.len});
-        new_uids.deinit(self.uid_tracker.allocator);
+        scan_result.deinit(self.uid_tracker.allocator);
         return;
     }
 
-    var delta = self.uid_tracker.updateAllowedUids(new_uids);
+    // Refresh unresolved_usernames from this scan: free old keys, store the new
+    // set (duped so the map owns its own copies independent of scan_result).
+    self.clearUnresolvedUsernames();
+    for (scan_result.unresolved.items) |name| {
+        const owned = self.uid_tracker.allocator.dupe(u8, name) catch continue;
+        self.unresolved_usernames.put(owned, {}) catch {
+            self.uid_tracker.allocator.free(owned);
+        };
+    }
+    // The scan's unresolved strings are no longer needed; the map holds copies.
+    for (scan_result.unresolved.items) |name| self.uid_tracker.allocator.free(name);
+    scan_result.unresolved.deinit(self.uid_tracker.allocator);
+
+    // updateAllowedUids takes ownership of scan_result.uids.
+    var delta = self.uid_tracker.updateAllowedUids(scan_result.uids);
     defer delta.deinit(self.uid_tracker.allocator);
+
+    // Reconcile active entries with /run/user/: a newly-allowed UID may already
+    // have a /run/user/<uid> directory (created while the UID was not yet
+    // allowed, e.g. during the undeploy/redeploy window). scanExisting adds
+    // such UIDs to the active set so the worker-start logic below picks them up.
+    self.uid_tracker.scanExisting(self.io);
 
     // Stop workers for removed UIDs
     for (delta.removed.items) |uid| {
@@ -407,6 +495,7 @@ test "handleAclChange updates allowed UIDs from ACL scan" {
             .inotify_fd = -1,
         },
         .managed_config = config_mod.ManagedConfig{ .config = config_mod.Config{} },
+        .unresolved_usernames = std.StringHashMap(void).init(allocator),
     };
     defer server.deinit();
 
@@ -464,6 +553,7 @@ test "handleAclChange preserves UIDs on empty scan result" {
             .inotify_fd = -1,
         },
         .managed_config = config_mod.ManagedConfig{ .config = config_mod.Config{} },
+        .unresolved_usernames = std.StringHashMap(void).init(allocator),
     };
     defer server.deinit();
 
@@ -528,6 +618,7 @@ test "handleAclChange detects username mismatch and stops worker" {
             .inotify_fd = -1,
         },
         .managed_config = config_mod.ManagedConfig{ .config = config_mod.Config{} },
+        .unresolved_usernames = std.StringHashMap(void).init(allocator),
     };
     defer server.deinit();
 
@@ -536,4 +627,107 @@ test "handleAclChange detects username mismatch and stops worker" {
 
     // Worker should have been stopped due to username mismatch
     try std.testing.expect(server.worker_manager.getWorkerUsername(0) == null);
+}
+
+/// Helper for pending-UID tests: build a minimal Server whose
+/// `unresolved_usernames` is seeded with the provided names. The server uses
+/// throwaway static paths (none of the ACL/worker paths are accessed by
+/// `processPendingUids`). Caller must `deinit` the returned server.
+fn newPendingTestServer(allocator: std.mem.Allocator, io: std.Io, unresolved_names: []const []const u8) !Server {
+    var unresolved = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var it = unresolved.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        unresolved.deinit();
+    }
+    for (unresolved_names) |name| {
+        const owned = try allocator.dupe(u8, name);
+        try unresolved.put(owned, {});
+    }
+
+    return Server{
+        .config = config_mod.Config{ .acl_dir = "/tmp/net-porter-pending-unused" },
+        .io = io,
+        .acl_manager = AclScanner.init(allocator, "/tmp/net-porter-pending-unused"),
+        .acl_watcher = AclWatcher{
+            .allocator = allocator,
+            .io = io,
+            .acl_dir = "/tmp/net-porter-pending-unused",
+            .inotify_fd = null,
+        },
+        .worker_manager = WorkerManager.init(io, allocator, null, "/tmp/net-porter-pending-workers"),
+        .uid_tracker = UidTracker{
+            .allocator = allocator,
+            .io = io,
+            .allowed_uids = .empty,
+            .entries = std.ArrayList(UidTracker.UidEntry).empty,
+            .inotify_fd = -1,
+        },
+        .managed_config = config_mod.ManagedConfig{ .config = config_mod.Config{} },
+        .unresolved_usernames = unresolved,
+    };
+}
+
+test "processPendingUids triggers rescan when UID matches unresolved username" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Seed an unresolved ACL username "root". UID 0 resolves to "root" via NSS,
+    // so a pending event for uid 0 should match and request an ACL re-scan.
+    const names = [_][]const u8{"root"};
+    var server = try newPendingTestServer(allocator, io, &names);
+    defer server.deinit();
+
+    try std.testing.expect(server.unresolved_usernames.contains("root"));
+
+    const pending = [_]u32{0};
+    try std.testing.expect(server.processPendingUids(&pending));
+}
+
+test "processPendingUids returns false when no UID matches unresolved username" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Seed an unresolved name that no real UID maps to. A pending uid 0
+    // resolves to "root", which is not in the set, so no rescan is requested.
+    const names = [_][]const u8{"definitelynotauser_xyz"};
+    var server = try newPendingTestServer(allocator, io, &names);
+    defer server.deinit();
+
+    const pending = [_]u32{0};
+    try std.testing.expect(!server.processPendingUids(&pending));
+}
+
+test "processPendingUids returns false on empty pending list" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const names = [_][]const u8{"root"};
+    var server = try newPendingTestServer(allocator, io, &names);
+    defer server.deinit();
+
+    const pending = [_]u32{};
+    try std.testing.expect(!server.processPendingUids(&pending));
+}
+
+test "UidEvents.pending is populated and freed via deinit" {
+    const allocator = std.testing.allocator;
+
+    // Construct a UidEvents with all three lists and verify deinit frees them
+    // without leaking (std.testing.allocator detects leaks).
+    var created = try std.ArrayList(u32).initCapacity(allocator, 1);
+    created.appendAssumeCapacity(1000);
+
+    var removed = try std.ArrayList(u32).initCapacity(allocator, 1);
+    removed.appendAssumeCapacity(2000);
+
+    var pending = try std.ArrayList(u32).initCapacity(allocator, 1);
+    pending.appendAssumeCapacity(3000);
+
+    var events = UidTracker.UidEvents{
+        .created = created,
+        .removed = removed,
+        .pending = pending,
+    };
+    events.deinit(allocator);
 }
