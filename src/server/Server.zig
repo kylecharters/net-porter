@@ -262,14 +262,14 @@ pub fn run(self: *Server, opts: RunOpts) !void {
                 self.worker_manager.stopWorker(uid);
             }
             // Pending UIDs: `/run/user/<uid>` appeared while the UID was not in
-            // the allowed list. If the UID now resolves to a username we
-            // previously failed to resolve from an ACL file, the user was
-            // likely (re)created — re-scan ACLs so the UID is re-added to the
-            // allowed list and its worker starts.
+            // the allowed list. Always re-scan ACLs so the UID is re-evaluated
+            // for inclusion in the allowed list. We must not gate on whether
+            // the UID's username is currently in unresolved_usernames: a
+            // previous ACL scan may have resolved the name (clearing the set)
+            // before the user actually existed in NSS, which would silently
+            // drop the pending UID and leave its worker unstarted forever.
             if (uid_events.pending.items.len > 0) {
-                if (self.processPendingUids(uid_events.pending.items)) {
-                    self.handleAclChange();
-                }
+                self.handlePendingUids(uid_events.pending.items);
             }
             // IN_Q_OVERFLOW: kernel dropped events, so created/removed may be
             // incomplete. Reconcile by re-scanning /run/user/ for allowed UIDs
@@ -313,10 +313,30 @@ fn clearUnresolvedUsernames(self: *Server) void {
     self.unresolved_usernames.clearRetainingCapacity();
 }
 
+/// Process pending UIDs detected by UidTracker.
+///
+/// Always triggers an ACL re-scan when there are pending UIDs. The previous
+/// implementation only re-scanned when a pending UID's username matched an
+/// entry in `unresolved_usernames`, but that set can be empty even when
+/// recovery is needed: if a prior ACL scan resolved the username (clearing
+/// the set) before the user actually existed in NSS, the subsequent
+/// `/run/user/<uid>` event would find an empty set, return false, and the
+/// worker would never start. Always re-scanning fixes this without affecting
+/// the happy path — the re-scan is a cheap directory read plus one
+/// `getpwnam_r` per ACL file and is idempotent.
+pub fn handlePendingUids(self: *Server, pending: []const u32) void {
+    if (pending.len == 0) return;
+    self.handleAclChange();
+}
+
 /// Inspect pending UIDs (whose `/run/user/<uid>` appeared while the UID was not
 /// yet allowed) and check whether any resolves to a username we previously
 /// failed to resolve from an ACL file. Returns true when at least one pending
-/// UID matches, signalling the caller to re-scan ACLs.
+/// UID matches.
+///
+/// Not currently called from the event loop (which uses `handlePendingUids`
+/// for unconditional recovery), but retained as a utility for callers that
+/// want the selective matching behavior.
 fn processPendingUids(self: *Server, pending: []const u32) bool {
     for (pending) |uid| {
         const maybe_name = user_mod.getUsername(self.uid_tracker.allocator, uid) catch continue;
@@ -730,4 +750,70 @@ test "UidEvents.pending is populated and freed via deinit" {
         .pending = pending,
     };
     events.deinit(allocator);
+}
+
+test "handlePendingUids always rescans even when username not unresolved" {
+    // Regression: pending UIDs whose username was not in unresolved_usernames
+    // were silently dropped by the event loop's old `processPendingUids`-based
+    // guard. When a user is created after its ACL file, a previous ACL scan
+    // resolves the name (clearing unresolved_usernames) before the pending
+    // /run/user/<uid> event fires — so the selective check returned false and
+    // the worker never started. handlePendingUids must always re-scan.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const test_utils = @import("../test_utils.zig");
+
+    var test_dir = try AclScanner.TestAclDir.create(io, allocator);
+    defer test_dir.deinit();
+
+    var tfr = try test_utils.newTempFileManager(io, allocator, "srv-pending-");
+    tfr.should_clean_file = true;
+    defer tfr.deinit();
+
+    // root.json resolves to uid 0 via NSS on the test host.
+    try test_dir.writeFile("root.json", "{}");
+
+    // Pretend /run/user/0 already exists: uid 0 is active.
+    var entries = std.ArrayList(UidTracker.UidEntry).initCapacity(allocator, 1) catch return error.Unexpected;
+    entries.appendAssumeCapacity(.{ .uid = 0 });
+
+    // allowed_uids is EMPTY — root not yet allowed.
+    const allowed_uids: std.ArrayList(u32) = .empty;
+
+    // unresolved_usernames is EMPTY — simulates the bug scenario where a
+    // previous ACL scan resolved root (or the list was cleared), so the old
+    // selective check would have returned false and skipped the re-scan.
+    var server = Server{
+        .config = config_mod.Config{ .acl_dir = test_dir.dir_path },
+        .io = io,
+        .acl_manager = AclScanner.init(allocator, test_dir.dir_path),
+        .acl_watcher = AclWatcher{
+            .allocator = allocator,
+            .io = io,
+            .acl_dir = test_dir.dir_path,
+            .inotify_fd = null,
+        },
+        .worker_manager = WorkerManager.init(io, allocator, null, tfr.temp_dir_path),
+        .uid_tracker = UidTracker{
+            .allocator = allocator,
+            .io = io,
+            .allowed_uids = allowed_uids,
+            .entries = entries,
+            .inotify_fd = -1,
+        },
+        .managed_config = config_mod.ManagedConfig{ .config = config_mod.Config{} },
+        .unresolved_usernames = std.StringHashMap(void).init(allocator),
+    };
+    defer server.deinit();
+
+    // Precondition: root is active but not allowed.
+    try std.testing.expect(server.uid_tracker.isUidActive(0));
+    try std.testing.expect(!server.uid_tracker.isUidAllowed(0));
+
+    // A pending event for uid 0 must trigger an ACL re-scan unconditionally.
+    server.handlePendingUids(&[_]u32{0});
+
+    // After: root should be allowed (ACL re-scan resolved root -> uid 0).
+    try std.testing.expect(server.uid_tracker.isUidAllowed(0));
+    try std.testing.expect(server.uid_tracker.isUidActive(0));
 }
