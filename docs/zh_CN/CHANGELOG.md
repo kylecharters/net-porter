@@ -5,6 +5,14 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.5.3] - 2026-07-19
+
+### 修复
+
+- **Pending UID 恢复（用户名不在未解析列表中时）**：当 `/run/user/<uid>` 目录出现但 UID 不在 ACL 允许列表中时，如果该 UID 的用户名不在 `unresolved_usernames` 集合中，该 UID 会被静默丢弃。这种情况在 ACL 文件先于系统用户创建时发生（例如自动化部署中 `net_porter_acl` 角色先于 `setup` 角色创建用户）：初次 ACL 扫描未能解析用户名，但随后的扫描（由其他 ACL 文件变更触发）成功解析并清除了 `unresolved_usernames` 中的记录。当用户随后被创建且 `/run/user/<uid>` 出现时，pending UID 不再匹配任何未解析用户名，因此不会触发 ACL 重扫描，Worker 永远不会启动。服务器现在在任何 pending UID 出现时无条件触发 ACL 重扫描，确保新可解析的用户名无论之前的扫描状态如何都能被正确识别。
+
+---
+
 ## [1.5.2] - 2026-07-04
 
 ### 修复
@@ -399,6 +407,7 @@
 
 _初始公开发布，采用每用户服务架构。_
 
+[1.5.3]: https://github.com/a-light-win/net-porter/compare/1.5.2...1.5.3
 [1.5.2]: https://github.com/a-light-win/net-porter/compare/1.5.1...1.5.2
 [1.5.1]: https://github.com/a-light-win/net-porter/compare/1.5.0...1.5.1
 [1.5.0]: https://github.com/a-light-win/net-porter/compare/1.4.0...1.5.0

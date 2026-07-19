@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.3] - 2026-07-19
+
+### Fixed
+
+- **Pending UID recovery when username not in unresolved list**: UIDs that appeared in `/run/user/<uid>` while not in the ACL allowed list were silently dropped if their username was not in the `unresolved_usernames` set. This happened when an ACL file was created before the system user existed (e.g., during automated deployment where the `net_porter_acl` role runs before the `setup` role creates the user): the initial ACL scan failed to resolve the username, but a subsequent scan — triggered by another ACL file change — resolved it successfully and cleared the `unresolved_usernames` entry. When the user was later created and `/run/user/<uid>` appeared, the pending UID no longer matched any unresolved name, so no ACL re-scan was triggered and the worker never started. The server now unconditionally triggers an ACL re-scan when any pending UID is detected, ensuring newly resolvable usernames are picked up regardless of prior scan state.
+
+---
+
 ## [1.5.2] - 2026-07-04
 
 ### Fixed
@@ -400,6 +408,7 @@ See the [Migration Guide (0.4 → 0.5)](migration-guide-0.4-to-0.5.md) for step-
 
 _Initial public release with per-user service architecture._
 
+[1.5.3]: https://github.com/a-light-win/net-porter/compare/1.5.2...1.5.3
 [1.5.2]: https://github.com/a-light-win/net-porter/compare/1.5.1...1.5.2
 [1.5.1]: https://github.com/a-light-win/net-porter/compare/1.5.0...1.5.1
 [1.5.0]: https://github.com/a-light-win/net-porter/compare/1.4.0...1.5.0
