@@ -448,7 +448,7 @@ fn validateNetnsPath(netns: []const u8, uid: u32) !void {
     }
 }
 
-/// Verify that the catatonit process is still alive, still named "catatonit",
+/// Verify that the catatonit process is still alive, still named "podman-init",
 /// and still owned by the expected UID.
 ///
 /// Called before each setup/teardown request that resolves a netns path through
@@ -458,8 +458,8 @@ fn validateNetnsPath(netns: []const u8, uid: u32) !void {
 ///
 /// Checks:
 ///   1. /proc/<pid> directory exists and is owned by expected_uid (statx)
-///   2. /proc/<pid>/comm contains "catatonit" (not a recycled process)
-///   3. /proc/<pid>/exe symlink ends with "/catatonit" (cannot be spoofed via prctl)
+///   2. /proc/<pid>/comm contains "podman-init" (not a recycled process)
+///   3. /proc/<pid>/exe symlink ends with "/podman-init" (cannot be spoofed via prctl)
 fn verifyCatatonitProcess(io: std.Io, pid: std.posix.pid_t, expected_uid: u32) !void {
     // Check 1: Process UID via statx on /proc/<pid>
     var path_buf: [64:0]u8 = undefined;
@@ -492,7 +492,7 @@ fn verifyCatatonitProcess(io: std.Io, pid: std.posix.pid_t, expected_uid: u32) !
     if (n == 0) return error.CatatonitProcessGone;
 
     const name = std.mem.trim(u8, read_buf[0..n], " \t\r\n");
-    if (!std.mem.eql(u8, name, "catatonit")) {
+    if (!std.mem.eql(u8, name, "podman-init")) {
         log.warn("catatonit comm mismatch: pid={d} expected 'catatonit' got '{s}'", .{ pid, name });
         return error.CatatonitNotCatatonit;
     }
@@ -509,8 +509,8 @@ fn verifyCatatonitProcess(io: std.Io, pid: std.posix.pid_t, expected_uid: u32) !
         return error.CatatonitProcessGone;
     };
     const exe = exe_buf[0..exe_n];
-    if (!std.mem.endsWith(u8, exe, "/catatonit") and !std.mem.endsWith(u8, exe, "/catatonit (deleted)")) {
-        log.warn("catatonit exe mismatch: pid={d} exe='{s}' does not end with /catatonit", .{ pid, exe });
+    if (!std.mem.endsWith(u8, exe, "/podman-init") and !std.mem.endsWith(u8, exe, "/podman-init (deleted)")) {
+        log.warn("catatonit exe mismatch: pid={d} exe='{s}' does not end with /podman-init", .{ pid, exe });
         return error.CatatonitNotCatatonit;
     }
 }

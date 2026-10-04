@@ -1012,7 +1012,7 @@ fn checkProcessUidByStat(pid: std.posix.pid_t, target_uid: u32) bool {
     return statx_buf.uid == target_uid;
 }
 
-/// Read /proc/<pid>/comm and check if the process name is "catatonit".
+/// Read /proc/<pid>/comm and check if the process name is "podman-init".
 /// Uses readPositionalAll (pread) instead of Reader.allocRemaining to avoid
 /// the sendFile path which incorrectly returns EndOfStream for /proc files.
 fn isCatatonit(io: std.Io, pid: std.posix.pid_t) bool {
@@ -1027,7 +1027,7 @@ fn isCatatonit(io: std.Io, pid: std.posix.pid_t) bool {
     if (n == 0) return false;
 
     const name = std.mem.trim(u8, buf[0..n], " \t\r\n");
-    return std.mem.eql(u8, name, "catatonit");
+    return std.mem.eql(u8, name, "podman-init");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
